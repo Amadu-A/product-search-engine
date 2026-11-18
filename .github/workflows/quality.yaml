@@ -1,0 +1,14 @@
+# .github/workflows/quality.yaml
+# CI запускает тот же Linux quality gate с отдельной временной PostgreSQL.
+name: quality
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ruff и тесты с PostgreSQL
+        run: bash scripts/test.sh

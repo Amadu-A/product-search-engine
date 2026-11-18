@@ -1,0 +1,12 @@
+# .dockerignore
+# Секреты, локальные данные и артефакты никогда не попадают в образ.
+.git
+.env
+.tmp
+examples
+renders
+.idea
+**/__pycache__
+*.log
+*.pem
+*.key

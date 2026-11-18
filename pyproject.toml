@@ -1,0 +1,47 @@
+# pyproject.toml
+# Зависимости CLI и единые настройки качества; все кэши остаются в .tmp/.
+[project]
+name = "product-search-engine"
+version = "0.1.0"
+description = "Проверяемый импорт иерархии категорий строительных товаров"
+requires-python = ">=3.12"
+dependencies = [
+  "alembic>=1.14,<2",
+  "beautifulsoup4>=4.12,<5",
+  "httpx>=0.28,<1",
+  "psycopg[binary]>=3.2,<4",
+  "pydantic-settings>=2.7,<3",
+  "sqlalchemy>=2.0,<3",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.3,<10", "pytest-cov>=6,<8", "ruff>=0.11,<1"]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+cache-dir = ".tmp/ruff_cache"
+exclude = [".tmp", "examples", "renders"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+cache_dir = ".tmp/pytest_cache"
+addopts = "--basetemp=.tmp/temp/pytest -ra"
+markers = ["integration: реальная изолированная PostgreSQL, требуется TEST_DATABASE_URL"]
+
+[tool.coverage.run]
+branch = true
+source = ["app"]
+data_file = ".tmp/coverage/.coverage"
+
+[tool.coverage.xml]
+output = ".tmp/coverage/coverage.xml"
+
+[tool.coverage.html]
+directory = ".tmp/coverage/html"

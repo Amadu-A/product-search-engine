@@ -1,0 +1,25 @@
+{
+  "source": {
+    "key": "synthetic",
+    "title": "Собственный синтетический классификатор для тестирования",
+    "license": "CC0-1.0",
+    "reference": "tests/fixtures/README.md",
+    "attribution": "Создан в проекте product-search-engine; не является каталогом Петровича",
+    "license_notice": "Синтетические данные проекта предоставлены по CC0 1.0 Universal.",
+    "usage_status": "synthetic"
+  },
+  "complete": true,
+  "nodes": [
+    {"external_id": "materials", "name": "Материалы", "children": [
+      {"external_id": "mixtures", "name": "Смеси", "children": [
+        {"external_id": "cement", "name": "Цемент"},
+        {"external_id": "plaster", "name": "Штукатурка"}
+      ]},
+      {"external_id": "materials-parts", "name": "Комплектующие"}
+    ]},
+    {"external_id": "engineering", "name": "Инженерные системы", "children": [
+      {"external_id": "pipes", "name": "Трубы"},
+      {"external_id": "engineering-parts", "name": "Комплектующие"}
+    ]}
+  ]
+}

@@ -1,0 +1,76 @@
+# compose.yaml
+# Только проектная PostgreSQL и одноразовый CLI; host ports и shared-зависимости не нужны.
+name: product-search-engine
+x-logging: &logging
+  driver: local
+  options:
+    max-size: "10m"
+    max-file: "5"
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16.15-alpine}
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-product_search}
+      POSTGRES_USER: ${POSTGRES_USER:-product_search_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Заполните POSTGRES_PASSWORD в приватном .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks: [private]
+    mem_limit: ${POSTGRES_MEMORY_LIMIT:-512m}
+    logging: *logging
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  app:
+    image: product-search-engine:local
+    profiles: [tools]
+    build:
+      context: .
+      target: runtime
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.12-slim}
+        VCS_REF: ${VCS_REF:-unknown}
+    user: "${APP_UID:-1000}:${APP_GID:-1000}"
+    env_file:
+      - .env.example
+      - path: .env
+        required: false
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-product_search}
+      POSTGRES_USER: ${POSTGRES_USER:-product_search_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Заполните POSTGRES_PASSWORD в приватном .env}
+      DB_CONNECT_TIMEOUT: ${DB_CONNECT_TIMEOUT:-5}
+      DB_STATEMENT_TIMEOUT_MS: ${DB_STATEMENT_TIMEOUT_MS:-30000}
+      SOURCE_BASE_URL: ${SOURCE_BASE_URL:-https://petrovich.ru}
+      SOURCE_CATALOG_PATH: ${SOURCE_CATALOG_PATH:-/catalog/}
+      HTTP_USER_AGENT: ${HTTP_USER_AGENT:-ProductSearchTaxonomy/0.1}
+      HTTP_TIMEOUT_SECONDS: ${HTTP_TIMEOUT_SECONDS:-20}
+      HTTP_MAX_RESPONSE_BYTES: ${HTTP_MAX_RESPONSE_BYTES:-8388608}
+      SNAPSHOT_MAX_BYTES: ${SNAPSHOT_MAX_BYTES:-67108864}
+      HTTP_MIN_INTERVAL_SECONDS: ${HTTP_MIN_INTERVAL_SECONDS:-2}
+      HTTP_RETRIES: ${HTTP_RETRIES:-2}
+      TAXONOMY_MAX_NODES: ${TAXONOMY_MAX_NODES:-20000}
+      TAXONOMY_MAX_DEPTH: ${TAXONOMY_MAX_DEPTH:-32}
+      ARTIFACT_DIR: ${ARTIFACT_DIR:-.tmp/taxonomy}
+      PERMISSION_FILE: ${PERMISSION_FILE:-.tmp/taxonomy/permission.json}
+      REPORT_FILE: ${REPORT_FILE:-.tmp/reports/petrovich_taxonomy_import.md}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./.tmp/taxonomy:/app/.tmp/taxonomy
+      - ./.tmp/reports:/app/.tmp/reports
+    networks: [private, egress]
+    mem_limit: ${APP_MEMORY_LIMIT:-512m}
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    logging: *logging
+networks:
+  private:
+    internal: true
+  egress: {}
+volumes:
+  postgres-data: {}
