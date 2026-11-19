@@ -28,18 +28,25 @@ from app.settings import Settings
 
 def parser() -> argparse.ArgumentParser:
     """Объявляет CLI-контракт без скрытых операций записи и комбинированного auto-apply."""
-    root = argparse.ArgumentParser(description="Импорт утверждённого дерева категорий")
+    root = argparse.ArgumentParser(description="Технический импорт локального дерева категорий")
     commands = root.add_subparsers(dest="command", required=True)
     export = commands.add_parser(
         "export", help="Экспорт законного вложенного JSON/HTML в плоский JSON"
     )
     export.add_argument("--input", type=Path, required=True)
     export.add_argument("--metadata", type=Path)
+    export.add_argument("--collector-report", type=Path)
+    importing = commands.add_parser(
+        "import", help="Проверка/preview локального JSON; --apply записывает БД"
+    )
+    importing.add_argument("--input", type=Path, required=True)
+    importing.add_argument("--collector-report", type=Path)
+    importing.add_argument("--apply", action="store_true")
     for name in ("validate", "preview", "apply", "review-template"):
         command = commands.add_parser(name)
         command.add_argument("--snapshot", type=Path)
         if name == "apply":
-            command.add_argument("--review", type=Path, required=True)
+            command.add_argument("--review", type=Path)
     commands.add_parser("report")
     commands.add_parser("db-check")
     commands.add_parser("fetch-petrovich", help="Один разрешённый каталог, без массового обхода")
@@ -82,19 +89,31 @@ def review_template(snapshot: Snapshot, settings: Settings) -> dict:
 
 def dispatch(args: argparse.Namespace, settings: Settings) -> dict:
     """Преобразует CLI-аргументы в вызов одного application use-case."""
-    if args.command == "export":
+    if args.command in {"export", "import"}:
         snapshot = normalize_file(
             args.input,
             settings.artifact_dir,
             settings.http_max_response_bytes,
-            args.metadata,
+            getattr(args, "metadata", None),
             settings.taxonomy_max_nodes,
             settings.taxonomy_max_depth,
+            collector_report_path=args.collector_report,
         )
+        if args.command == "import":
+            return build_import(settings, apply=args.apply).execute(
+                snapshot,
+                apply=args.apply,
+                commit_sha=settings.vcs_ref,
+            )
         return {
             "snapshot": str(settings.artifact_dir / "categories.json"),
             "sha256": snapshot_hash(snapshot),
             "nodes": len(snapshot.nodes),
+            "complete": snapshot.complete,
+            "normalization_report": str(settings.artifact_dir / "normalization_report.json"),
+            "warnings": validate_tree(
+                snapshot, settings.taxonomy_max_nodes, settings.taxonomy_max_depth
+            )["warnings"],
         }
     if args.command == "db-check":
         engine = create_db_engine(settings)
@@ -131,12 +150,15 @@ def dispatch(args: argparse.Namespace, settings: Settings) -> dict:
     if args.command == "review-template":
         return review_template(snapshot, settings)
     applying = args.command == "apply"
-    review = Review.model_validate_json(read_limited(args.review, 1048576)) if applying else None
+    review = (
+        Review.model_validate_json(read_limited(args.review, 1048576))
+        if applying and args.review
+        else None
+    )
     return build_import(settings, apply=applying).execute(
         snapshot,
         apply=applying,
         review=review,
-        permission=optional_permission(settings),
         commit_sha=settings.vcs_ref,
     )
 
@@ -173,7 +195,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 2
-    if args.command in {"apply", "preview", "export", "fetch-petrovich"}:
+    if args.command in {"import", "apply", "preview", "export", "fetch-petrovich"}:
         write_json(
             settings.report_file.parent / "last_attempt.json",
             {

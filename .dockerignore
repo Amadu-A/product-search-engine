@@ -4,6 +4,7 @@
 .env
 .tmp
 examples
+data
 renders
 .idea
 **/__pycache__

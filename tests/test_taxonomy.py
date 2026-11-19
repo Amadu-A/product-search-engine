@@ -18,7 +18,21 @@ from app.domain.taxonomy import (
 
 def test_metrics_and_same_names(snapshot):
     """Повтор названий у разных родителей допустим, точные метрики фиксированы."""
-    assert validate_tree(snapshot) == {
+    metrics = validate_tree(snapshot)
+    assert {
+        key: metrics[key]
+        for key in (
+            "total",
+            "roots",
+            "leaves",
+            "max_depth",
+            "levels",
+            "duplicates",
+            "cycles",
+            "orphans",
+            "errors",
+        )
+    } == {
         "total": 8,
         "roots": 2,
         "leaves": 5,
@@ -40,7 +54,6 @@ def test_metrics_and_same_names(snapshot):
         "name",
         "level",
         "path",
-        "incomplete",
         "source",
         "unstable_id",
         "order",
@@ -72,8 +85,6 @@ def test_rejects_corrupted_tree(snapshot, mutation):
     elif mutation == "order":
         nodes[-1] = nodes[-1].model_copy(update={"sort_order": 0})
     update = {"nodes": tuple(nodes)}
-    if mutation == "incomplete":
-        update["complete"] = False
     if mutation == "raw_hash":
         update["raw_sha256"] = "0" * 64
     with pytest.raises(TaxonomyError):
@@ -110,12 +121,7 @@ def test_review_is_bound_to_exact_snapshot(snapshot, review):
 
 
 def test_permission_is_not_inferred(snapshot):
-    """Синтетика разрешена для теста, Petrovich и NOASSERTION требуют реального основания."""
-    snapshot.source.require_reuse(None)
-    with pytest.raises(TaxonomyError):
-        snapshot.source.model_copy(update={"key": "petrovich"}).require_reuse(None)
-    with pytest.raises(TaxonomyError):
-        snapshot.source.model_copy(update={"license": "NOASSERTION"}).require_reuse(None)
+    """Разрешение HTTP-клиента остаётся строгим; импорт локальных файлов его не требует."""
     permission = Permission(
         source="petrovich",
         approved_by="Тестовый оператор",
@@ -126,3 +132,21 @@ def test_permission_is_not_inferred(snapshot):
     )
     with pytest.raises(TaxonomyError):
         permission.require("fetch")
+
+
+def test_partial_tree_keeps_structural_validation(snapshot):
+    """complete=false даёт предупреждение и не маскирует потерянных родителей."""
+    partial = snapshot.model_copy(update={"complete": False})
+    metrics = validate_tree(partial)
+    assert metrics["total"] == 8 and metrics["complete"] is False and metrics["errors"] == 0
+    assert {w["code"] for w in metrics["warnings"]} == {"incomplete_tree"}
+    broken = partial.model_copy(
+        update={
+            "nodes": (
+                partial.nodes[0].model_copy(update={"parent_id": uuid4()}),
+                *partial.nodes[1:],
+            )
+        }
+    )
+    with pytest.raises(TaxonomyError, match="родитель"):
+        validate_tree(broken)

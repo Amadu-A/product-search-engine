@@ -1,5 +1,5 @@
 # app/infrastructure/files.py
-"""Адаптер законно полученных файлов: JSON/семантический HTML и защищённый bundle."""
+"""Локальные JSON/HTML: исходные байты, отдельная нормализация и защищённый bundle."""
 
 import hashlib
 import json
@@ -34,12 +34,36 @@ class InputNode(BaseModel):
 
 
 class InputTree(BaseModel):
-    """Метаданные лицензии и явная декларация полноты предоставленного дерева."""
+    """Фактические метаданные и декларация полноты, которая не блокирует импорт."""
 
     model_config = ConfigDict(extra="forbid")
     source: SourceMetadata
     complete: bool
     nodes: list[InputNode]
+
+
+class CollectorReport(BaseModel):
+    """Проверяет типы счётчиков сборщика, сохраняя все дополнительные исходные поля."""
+
+    model_config = ConfigDict(extra="allow")
+    remaining_pages: int = Field(default=0, ge=0, strict=True)
+    errors: list[dict] = Field(default_factory=list)
+    redirects: list[dict] = Field(default_factory=list)
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict:
+    """Не допускает молчаливую подмену повторяющегося ключа внутри JSON-объекта."""
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise TaxonomyError("Повтор ключа внутри JSON-объекта")
+        result[key] = value
+    return result
+
+
+def read_json(data: bytes) -> object:
+    """Разбирает JSON без неоднозначных дублирующихся полей."""
+    return json.loads(data, object_pairs_hook=_unique_object)
 
 
 def read_limited(path: Path, max_bytes: int) -> bytes:
@@ -104,8 +128,25 @@ def normalize_file(
     metadata_path: Path | None = None,
     max_nodes: int = 20000,
     max_depth: int = 32,
+    collector_report_path: Path | None = None,
 ) -> Snapshot:
-    """Сохраняет исходные байты и экспортирует проверенное плоское дерево в categories.json."""
+    """Сохраняет исходники без изменений и отдельно нормализует дерево, включая неполное.
+
+    Из названий удаляются только крайние/повторные пробельные символы. Цены не
+    вырезаются: подозрительные названия получают признаки качества и предупреждение.
+    Отчёт сборщика сохраняется целиком, а его ошибки не становятся ошибками дерева.
+    """
+    outputs = {
+        output_dir / name
+        for name in (
+            "categories.json",
+            "categories.sha256",
+            "normalization_report.json",
+        )
+    }
+    inputs = [p for p in (input_path, metadata_path, collector_report_path) if p is not None]
+    if any(p.resolve() == target.resolve() for p in inputs for target in outputs):
+        raise TaxonomyError("Выходной файл совпадает с исходником; используйте другой каталог")
     raw = read_limited(input_path, max_bytes)
     raw_hash = hashlib.sha256(raw).hexdigest()
     proofs = []
@@ -113,7 +154,7 @@ def normalize_file(
         if metadata_path is None:
             raise TaxonomyError("HTML требует --metadata с условиями использования и complete")
         meta_raw = read_limited(metadata_path, max_bytes)
-        metadata = json.loads(meta_raw)
+        metadata = read_json(meta_raw)
         tree = InputTree.model_validate({**metadata, "nodes": html_nodes(raw)})
         method = "semantic-html"
         metadata_hash = hashlib.sha256(meta_raw).hexdigest()
@@ -122,24 +163,44 @@ def normalize_file(
         (output_dir / meta_name).write_bytes(meta_raw)
         proofs.append(FileProof(file=meta_name, sha256=metadata_hash))
     else:
-        tree = InputTree.model_validate_json(raw)
+        tree = InputTree.model_validate(read_json(raw))
         method = "structured-json"
+    collector = None
+    collector_raw = None
+    if collector_report_path is not None:
+        collector_raw = read_limited(collector_report_path, max_bytes)
+        collector = read_json(collector_raw)
+        CollectorReport.model_validate(collector)
+        collector_hash = hashlib.sha256(collector_raw).hexdigest()
+        proofs.append(FileProof(file=f"raw/{collector_hash}.collector.json", sha256=collector_hash))
     extracted_at = datetime.now(UTC)
     flat = []
+    normalizations = []
     stack = [(n, None, (), order) for order, n in reversed(list(enumerate(tree.nodes)))]
     while stack:
         current, parent, path, order = stack.pop()
         if current.kind != "category":
             raise TaxonomyError("Товарный узел среди категорий")
         node_id = category_id(tree.source.key, current.external_id, current.source_url)
-        full_path = (*path, current.name)
+        name = " ".join(current.name.split())
+        full_path = (*path, name)
+        if name != current.name:
+            normalizations.append(
+                {
+                    "external_id": current.external_id,
+                    "field": "name",
+                    "before": current.name,
+                    "after": name,
+                    "operation": "normalize_whitespace",
+                }
+            )
         if len(flat) >= max_nodes or len(full_path) > max_depth:
             raise TaxonomyError("Превышен лимит узлов или глубины")
         flat.append(
             Node(
                 id=node_id,
                 external_id=current.external_id,
-                name=current.name,
+                name=name,
                 parent_id=parent,
                 level=len(full_path),
                 path=full_path,
@@ -163,12 +224,32 @@ def normalize_file(
         raw_sha256=canonical_hash([p.model_dump() for p in proofs]),
         files=tuple(proofs),
         nodes=tuple(flat),
+        diagnostics={
+            "input_sha256": raw_hash,
+            "collector_report": collector,
+            "normalizations": normalizations,
+        },
     )
-    validate_tree(snapshot, max_nodes, max_depth)
+    metrics = validate_tree(snapshot, max_nodes, max_depth)
     (output_dir / "raw").mkdir(parents=True, exist_ok=True)
     (output_dir / raw_name).write_bytes(raw)
+    if collector_raw is not None:
+        (output_dir / f"raw/{collector_hash}.collector.json").write_bytes(collector_raw)
     write_json(output_dir / "categories.json", snapshot.model_dump(mode="json"))
     (output_dir / "categories.sha256").write_text(snapshot_hash(snapshot) + "\n", encoding="ascii")
+    write_json(
+        output_dir / "normalization_report.json",
+        {
+            "input_sha256": raw_hash,
+            "snapshot_sha256": snapshot_hash(snapshot),
+            "complete": snapshot.complete,
+            "normalization_count": len(normalizations),
+            "normalizations": normalizations,
+            "quality": metrics["quality"],
+            "warnings": metrics["warnings"],
+            "collection": metrics["collection"],
+        },
+    )
     return snapshot
 
 

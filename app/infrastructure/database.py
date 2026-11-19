@@ -34,6 +34,7 @@ categories = sa.Table(
     sa.Column("external_id", sa.Text),
     sa.Column("source_url", sa.Text),
     sa.Column("is_active", sa.Boolean, nullable=False, server_default=sa.true()),
+    sa.Column("quality_flags", JSONB, nullable=False, server_default=sa.text("'[]'::jsonb")),
     sa.Column(
         "created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
     ),
@@ -47,6 +48,7 @@ categories = sa.Table(
     sa.CheckConstraint("sort_order >= 0", name="ck_categories_sort_order"),
     sa.CheckConstraint("parent_id IS NULL OR parent_id <> id", name="ck_categories_self_parent"),
     sa.CheckConstraint("source = 'custom' OR external_id IS NOT NULL", name="ck_categories_key"),
+    sa.CheckConstraint("jsonb_typeof(quality_flags) = 'array'", name="ck_categories_quality_flags"),
     sa.Index("ix_categories_parent_id", "parent_id"),
 )
 import_runs = sa.Table(
@@ -59,7 +61,7 @@ import_runs = sa.Table(
     sa.Column("source", sa.String(64), nullable=False),
     sa.Column("commit_sha", sa.String(64), nullable=False),
     sa.Column("result", JSONB, nullable=False),
-    sa.Column("review", JSONB, nullable=False),
+    sa.Column("review", JSONB, nullable=True),
     sa.Column("permission", JSONB),
     sa.Column(
         "created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
@@ -139,7 +141,7 @@ class SqlImportUnitOfWork:
     def persist(
         self,
         snapshot: Snapshot,
-        review: Review,
+        review: Review | None,
         permission: Permission | None,
         plan: ImportPlan,
         commit_sha: str,
@@ -177,8 +179,8 @@ class SqlImportUnitOfWork:
                 source=snapshot.source.key,
                 commit_sha=commit_sha,
                 result=plan.counts(),
-                review=review.model_dump(mode="json"),
-                permission=permission.model_dump(mode="json") if permission else None,
+                review=review.model_dump(mode="json") if review else sa.null(),
+                permission=permission.model_dump(mode="json") if permission else sa.null(),
             )
         )
         return str(run_id)
@@ -194,7 +196,7 @@ def check_database(engine: Engine) -> dict:
         revision = connection.execute(
             sa.text("SELECT version_num FROM alembic_version")
         ).scalar_one()
-        if revision != "0001_taxonomy":
+        if revision != "0002_partial_import":
             raise TaxonomyError("Версия schema не соответствует приложению")
         count = connection.execute(sa.select(sa.func.count()).select_from(categories)).scalar_one()
     return {"status": "ready", "revision": revision, "categories": count}

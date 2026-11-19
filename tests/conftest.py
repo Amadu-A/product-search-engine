@@ -1,6 +1,7 @@
 # tests/conftest.py
 """Фикстуры собственных деревьев и отдельной PostgreSQL schema; production не очищается."""
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -49,7 +50,48 @@ def review(snapshot: Snapshot) -> Review:
 
 
 @pytest.fixture
-def db_engine():
+def partial_input(tmp_path: Path) -> tuple[Path, Path]:
+    """Создаёт собственную неполную фикстуру под ключом petrovich без внешних данных/HTTP."""
+    data = json.loads(Path("tests/fixtures/tree.json").read_text(encoding="utf-8"))
+    data["complete"] = False
+    data["source"].update(
+        key="petrovich", license="UNKNOWN", usage_status="unverified", license_notice=""
+    )
+    path = tmp_path / "partial.json"
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    report = tmp_path / "collector_report.json"
+    report.write_text(
+        json.dumps(
+            {
+                "remaining_pages": 192,
+                "errors": [{"url": "https://example.org/unprocessed/"}] * 20,
+                "redirects": [
+                    {
+                        "url": "https://example.org/alias/",
+                        "target": "https://example.org/canonical/",
+                    }
+                ]
+                * 4,
+                "categories": 8,
+                "input_complete": False,
+                "note": "Только синтетический отчёт тестов",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    return path, report
+
+
+@pytest.fixture
+def partial_snapshot(partial_input: tuple[Path, Path], tmp_path: Path) -> Snapshot:
+    """Экспортирует неполную синтетическую структуру с отчётом сборщика."""
+    path, report = partial_input
+    return normalize_file(path, tmp_path / "partial-bundle", 8388608, collector_report_path=report)
+
+
+@pytest.fixture
+def db_engine(request):
     """Применяет настоящую миграцию в уникальной schema только БД taxonomy_test."""
     url_string = Settings().test_database_url.get_secret_value()
     if not url_string:
@@ -71,7 +113,7 @@ def db_engine():
     try:
         config = Config("alembic.ini")
         config.attributes["engine"] = engine
-        command.upgrade(config, "head")
+        command.upgrade(config, getattr(request, "param", "head"))
         yield engine
     finally:
         engine.dispose()

@@ -25,7 +25,7 @@ class ImportUnitOfWork(Protocol):
     def persist(
         self,
         snapshot: Snapshot,
-        review: Review,
+        review: Review | None,
         permission: Permission | None,
         plan: ImportPlan,
         commit_sha: str,

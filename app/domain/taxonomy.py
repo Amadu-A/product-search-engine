@@ -11,9 +11,11 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.domain.quality import category_quality_flags, tree_diagnostics
+
 
 class TaxonomyError(ValueError):
-    """Останавливает импорт при нарушении структуры, прав или целостности данных."""
+    """Останавливает импорт при нарушении структуры либо целостности данных."""
 
 
 class Contract(BaseModel):
@@ -89,6 +91,7 @@ class Node(Contract):
             "external_id": key,
             "source_url": self.source_url,
             "is_active": True,
+            "quality_flags": category_quality_flags(self.name, self.path),
         }
 
 
@@ -104,24 +107,11 @@ class SourceMetadata(Contract):
 
     key: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")
     title: str = Field(min_length=1)
-    license: str = Field(min_length=1)
-    reference: str = Field(min_length=1)
-    attribution: str
-    license_notice: str
-    usage_status: Literal["unverified", "licensed", "approved", "synthetic"]
-
-    def require_reuse(self, permission: "Permission | None") -> None:
-        """Блокирует неподтверждённое использование и требует основание для approved."""
-        if self.key == "custom":
-            raise TaxonomyError("Источник custom зарезервирован для пользовательских категорий")
-        if not all(value.strip() for value in (self.title, self.license, self.reference)):
-            raise TaxonomyError("Не заполнены сведения о происхождении")
-        if self.usage_status in {"unverified", "approved"} or self.key == "petrovich":
-            if permission is None or permission.source != self.key:
-                raise TaxonomyError("BLOCKED: необходимо документированное разрешение источника")
-            permission.require("reuse")
-        elif self.license in {"NOASSERTION", "UNKNOWN"} or not self.license_notice.strip():
-            raise TaxonomyError("Не сохранены условия и лицензионное уведомление источника")
+    license: str = "UNKNOWN"
+    reference: str = ""
+    attribution: str = ""
+    license_notice: str = ""
+    usage_status: Literal["unverified", "licensed", "approved", "synthetic"] = "unverified"
 
 
 class Sample(Contract):
@@ -174,6 +164,7 @@ class Snapshot(Contract):
     raw_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     files: tuple[FileProof, ...] = Field(min_length=1)
     nodes: tuple[Node, ...]
+    diagnostics: dict | None = None
 
 
 def check_date(value: datetime) -> None:
@@ -189,20 +180,23 @@ def canonical_hash(value: object) -> str:
 
 
 def snapshot_hash(snapshot: Snapshot) -> str:
-    """Связывает проверку полноты и импорт с точной версией снимка."""
-    return canonical_hash(snapshot.model_dump(mode="json"))
+    """Связывает импорт с версией снимка, сохраняя SHA прежних снимков без diagnostics."""
+    data = snapshot.model_dump(mode="json")
+    if snapshot.diagnostics is None:
+        data.pop("diagnostics")
+    return canonical_hash(data)
 
 
 def validate_tree(snapshot: Snapshot, max_nodes: int = 20000, max_depth: int = 32) -> dict:
     """Проверяет связность, циклы, ключи, пути и manifest; возвращает реальные метрики.
 
-    Неполный снимок и неоднозначное родительство блокируются до открытия транзакции.
-    Полнота относительно сайта дополнительно подтверждается отдельным Review.
+    Неоднозначное родительство блокируется до транзакции. Неполнота внешнего
+    каталога и неизвестные условия использования отражаются информационно.
     """
     check_date(snapshot.extracted_at)
     nodes = snapshot.nodes
-    if not snapshot.complete or not nodes or len(nodes) > max_nodes:
-        raise TaxonomyError("Пустое, неполное или превышающее лимит дерево")
+    if not nodes or len(nodes) > max_nodes:
+        raise TaxonomyError("Пустое или превышающее лимит дерево")
     indexed = {node.id: node for node in nodes}
     keys = [stable_key(n.external_id, n.source_url) for n in nodes]
     urls = [n.source_url for n in nodes if n.source_url is not None]
@@ -252,6 +246,7 @@ def validate_tree(snapshot: Snapshot, max_nodes: int = 20000, max_depth: int = 3
         "cycles": 0,
         "orphans": 0,
         "errors": 0,
+        **tree_diagnostics(snapshot),
     }
 
 

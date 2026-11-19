@@ -37,7 +37,7 @@ class BuildReport:
             f"Статус: **{status}**",
             "",
             "Метрики ниже рассчитаны SQL в одной read-only транзакции. "
-            "Наличие тестового источника не означает загрузку Петровича.",
+            "Неполнота и качество названий отражаются отдельно от структурных ошибок.",
             "",
             "| Показатель | Значение |",
             "| --- | ---: |",
@@ -80,6 +80,8 @@ class BuildReport:
                             "extracted_at": payload["extracted_at"],
                             "raw_sha256": payload["raw_sha256"],
                             "files": payload["files"],
+                            "complete": payload["complete"],
+                            "diagnostics": payload.get("diagnostics"),
                         },
                         ensure_ascii=False,
                         indent=2,
@@ -99,7 +101,14 @@ class BuildReport:
                     r
                     for r in history
                     if r["source"] == run["source"]
-                    and r["snapshot_sha256"] == run["snapshot_sha256"]
+                    and (
+                        r["snapshot_sha256"] == run["snapshot_sha256"]
+                        or (
+                            result.get("metrics", {}).get("input_sha256") is not None
+                            and r["result"].get("metrics", {}).get("input_sha256")
+                            == result["metrics"]["input_sha256"]
+                        )
+                    )
                     and r["created_at"] < run["created_at"]
                 ),
                 None,
@@ -123,21 +132,41 @@ class BuildReport:
             )
         lines.extend(
             [
+                "## Подозрительные категории в PostgreSQL",
+                "",
+                "Цена или признак коллекции требует проверки. Пустые flags также не означают "
+                "подтверждённую достоверность категории. Активность и названия не менялись.",
+                "",
+                "```json",
+                json.dumps(
+                    data.get("quality_nodes", []), ensure_ascii=False, indent=2, default=str
+                ),
+                "```",
+                "",
+            ]
+        )
+        lines.extend(
+            [
                 "## Проверки и ограничения",
                 "",
                 "```json",
                 json.dumps(context, ensure_ascii=False, indent=2, default=str),
                 "```",
                 "",
-                "Полнота относительно внешнего источника подтверждается review точного SHA. "
+                "complete сохраняется как во входном JSON; "
+                "отчёт сборщика отражён в снимке и аудите. "
                 "SQL проверяет фактическую связность БД, но не доказывает полноту чужого каталога. "
+                "UNKNOWN/unverified и отсутствие уведомления информационны "
+                "и не запрещают загрузку. "
                 "Пропавшие категории сохраняются; custom не заменяются. "
                 "Повторный apply здесь отражается только при наличии двух реальных audit runs.",
                 "",
                 "## Воспроизведение",
                 "",
                 "`bash scripts/test.sh` — изолированные тесты; "
-                "`docker compose run --rm app report` — повторить этот отчёт.",
+                "`docker compose --env-file .env.example --env-file .env "
+                "run --rm --no-deps app report` "
+                "— повторить этот отчёт.",
                 "",
             ]
         )

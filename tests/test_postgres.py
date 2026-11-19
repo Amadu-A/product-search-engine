@@ -1,11 +1,14 @@
 # tests/test_postgres.py
 """Live integration: настоящие миграции, rollback, custom, repeat и SQL-отчёт в тестовой БД."""
 
-from uuid import uuid4
+import json
+from uuid import UUID, uuid4
 
 import pytest
 import sqlalchemy as sa
+from alembic import command
 from alembic.autogenerate import compare_metadata
+from alembic.config import Config
 from alembic.migration import MigrationContext
 
 from app.application.import_tree import ImportTree
@@ -19,6 +22,7 @@ from app.infrastructure.database import (
     metadata,
     snapshots,
 )
+from app.infrastructure.files import normalize_file, write_json
 from app.infrastructure.reporting import SqlReportRepository
 from tests.conftest import approved_review
 
@@ -34,7 +38,7 @@ def test_migration_matches_models(db_engine):
     """Живая Alembic schema точно соответствует ORM metadata и readiness-контракту."""
     assert check_database(db_engine) == {
         "status": "ready",
-        "revision": "0001_taxonomy",
+        "revision": "0002_partial_import",
         "categories": 0,
     }
     with db_engine.connect() as conn:
@@ -144,3 +148,105 @@ def test_sql_report_finds_disconnected_cycle(db_engine, snapshot, review):
     counts = SqlReportRepository(db_engine).inspect()["counts"]
     assert counts["cycles"] == 1
     assert counts["unreachable"] == 5 and counts["errors"] > 0
+
+
+def test_partial_apply_repeat_extend_and_report(
+    db_engine, partial_input, partial_snapshot, tmp_path
+):
+    """Неполное дерево дополняется без дубликатов, подтверждений или потери custom."""
+    first = importer(db_engine).execute(partial_snapshot, apply=True)
+    assert first["added"] == 8 and first["metrics"]["complete"] is False
+    path, collector_report = partial_input
+    repeated_snapshot = normalize_file(
+        path, tmp_path / "repeated", 8388608, collector_report_path=collector_report
+    )
+    repeated = importer(db_engine).execute(repeated_snapshot, apply=True)
+    assert repeated["added"] == repeated["updated"] == 0 and repeated["skipped"] == 8
+    custom_id = uuid4()
+    with db_engine.begin() as conn:
+        conn.execute(
+            sa.insert(categories).values(
+                id=custom_id,
+                name="Пользовательская",
+                slug="own-custom",
+                sort_order=0,
+                source="custom",
+            )
+        )
+    data = json.loads(path.read_bytes())
+    data["nodes"][0]["children"].append({"external_id": "new-child", "name": "Новая дочерняя"})
+    data["nodes"][1]["children"][0]["name"] = "Трубы пластиковые"
+    write_json(path, data)
+    extended = normalize_file(
+        path, tmp_path / "extended", 8388608, collector_report_path=collector_report
+    )
+    result = importer(db_engine).execute(extended, apply=True)
+    assert result["added"] == 1 and result["updated"] == 1 and result["after"] == 10
+    with db_engine.connect() as conn:
+        assert (
+            conn.execute(
+                sa.select(categories.c.name).where(categories.c.id == custom_id)
+            ).scalar_one()
+            == "Пользовательская"
+        )
+        stored = (
+            conn.execute(sa.select(import_runs).order_by(import_runs.c.created_at)).mappings().all()
+        )
+        assert all(row["review"] is None and row["permission"] is None for row in stored)
+        assert (
+            conn.execute(
+                sa.select(sa.func.count())
+                .select_from(import_runs)
+                .where(import_runs.c.review.is_(None), import_runs.c.permission.is_(None))
+            ).scalar_one()
+            == 3
+        )
+        assert stored[0]["result"]["metrics"]["collection"]["errors"] == 20
+        assert stored[0]["result"]["metrics"]["collection"]["redirects"] == 4
+        assert stored[0]["result"]["metrics"]["source_information"]["license"] == "UNKNOWN"
+    report = BuildReport(SqlReportRepository(db_engine)).execute("test-sha", {})
+    assert '"complete": false' in report and '"remaining_pages": 192' in report
+    assert '"repeated_unchanged": true' in report
+
+
+def test_partial_quality_flags_are_persisted(db_engine, partial_input, tmp_path):
+    """Подозрительная коллекция импортируется с исходной ценой и явными flags для проверки."""
+    path, collector_report = partial_input
+    data = json.loads(path.read_bytes())
+    data["nodes"][0]["children"][0]["children"][0]["name"] = "Серия (Тест)от 500 ₽ / м²"
+    write_json(path, data)
+    snapshot = normalize_file(
+        path, tmp_path / "quality", 8388608, collector_report_path=collector_report
+    )
+    importer(db_engine).execute(snapshot, apply=True)
+    report = SqlReportRepository(db_engine).inspect()
+    assert report["counts"]["total"] == 8 and report["counts"]["errors"] == 0
+    assert report["counts"]["suspected_categories"] == 1
+    row = report["quality_nodes"][0]
+    assert row["name"] == "Серия (Тест)от 500 ₽ / м²"
+    assert row["quality_flags"] == ["price_in_name", "suspected_product_collection"]
+
+
+@pytest.mark.parametrize("db_engine", ["0001_taxonomy"], indirect=True)
+def test_upgrade_preserves_old_baseline_and_manual_name(db_engine, snapshot):
+    """Миграция старой БД не перезаписывает ручные значения и не создаёт ложных конфликтов."""
+    old_categories = sa.Table("categories", sa.MetaData(), autoload_with=db_engine)
+    values = snapshot.nodes[0].imported_values()
+    values.pop("quality_flags")
+    persisted = {**values, "id": UUID(values["id"]), "imported_values": values}
+    persisted["name"] = "Ручное имя до миграции"
+    with db_engine.begin() as conn:
+        conn.execute(sa.insert(old_categories).values(**persisted))
+    config = Config("alembic.ini")
+    config.attributes["engine"] = db_engine
+    command.upgrade(config, "head")
+    with db_engine.connect() as conn:
+        row = conn.execute(sa.select(categories)).mappings().one()
+        assert row["name"] == "Ручное имя до миграции" and row["quality_flags"] == []
+        assert row["imported_values"] == {**values, "quality_flags": []}
+    with pytest.raises(TaxonomyError, match="Ручные"):
+        importer(db_engine).execute(snapshot, apply=True)
+    with db_engine.begin() as conn:
+        conn.execute(sa.update(categories).values(name=values["name"]))
+    result = importer(db_engine).execute(snapshot, apply=True)
+    assert result["added"] == 7 and result["skipped"] == 1

@@ -1,142 +1,159 @@
 <!-- docs/import.md -->
-# Контракт и эксплуатация импорта
+# Импорт локального частичного дерева
 
-## Формат и происхождение
+## Контракт
 
-Независимый от поставщика вход JSON показан в `tests/fixtures/tree.json`:
-`source`, `complete`, `nodes`; каждый узел содержит `external_id`, `name`,
-необязательные `source_url`, `children`, `kind=category`.
-Только явно полное дерево проходит валидацию. Это декларация предоставившего файл,
-поэтому apply дополнительно требует независимый review полного снимка.
+Вложенный JSON содержит `source`, `complete` и `nodes`. Узлы: `external_id`,
+`name`, необязательные `source_url`, `children`, `kind=category`.
+Пример формата — `tests/fixtures/tree.json`. `complete: false` разрешён при export,
+validate, preview и apply, сохраняется без подмены и означает предупреждение о полноте.
+Отсутствующий родитель, цикл, повтор ID/URL, неверный путь/уровень и превышение
+лимитов по-прежнему запрещают запись. Все фактически полученные 2775 узлов могут
+быть загружены, даже если исходный сайт обойдён не полностью.
 
-`source` содержит `key`, `title`, `license`, `reference`, `attribution`,
-`license_notice`, `usage_status`. Значения статуса:
-`unverified` — права не установлены; `approved` — документированное разрешение;
-`licensed` — указана применимая лицензия и сохранено уведомление;
-`synthetic` — собственные тестовые данные. Не назначайте `synthetic` сторонним данным.
-Для лицензированного классификатора сохраняйте точную версию/commit в reference,
-лицензию, attribution и полный применимый текст license_notice.
-Для Shopify Standard Product Taxonomy при необходимости требуется MIT-уведомление;
-проект не зависит от его ID, версии или схемы хранения.
+Метаданные `source`: `key`, `title`, `license`, `reference`, `attribution`,
+`license_notice`, `usage_status`. Неизвестная лицензия (`UNKNOWN`), `unverified`
+и пустое уведомление сохраняются как есть, информационно. Они не меняют
+активность категорий, не запрещают технический импорт и не заменяются разрешением.
+Локальный импорт не читает `permission.json` и не требует `review.json`, в том
+числе для `source.key=petrovich`. HTTP-адаптер имеет отдельные прежние ограничения.
 
-HTML-контракт — один `ul[data-taxonomy]`, вложенные прямые `li` с
-`data-external-id`, одной прямой `a` или `span[data-name]` и необязательным `ul` детей.
-Тот же контракт показан в `tests/fixtures/tree.html`. Передайте `--metadata`
-с JSON `{"source": {...}, "complete": true}`. Чужая неизвестная вёрстка требует
-отдельного проверенного адаптера; ссылки со всей страницы не превращаются в дерево.
-Изображения и карточки товаров не запрашиваются. Поле `kind` и review не позволяют
-считать произвольную товарную выгрузку достоверным классификатором.
+Внутренние UUIDv5 и slug устойчивы относительно source + external_id.
+При отсутствии ID используется канонический HTTPS URL с ключом `url:<URL>`.
+Изменение имени/родителя не меняет UUID. Источник `custom` зарезервирован для
+пользовательских категорий и не может быть источником массового импорта.
+Корень имеет level=1, полный путь — массив названий.
 
-Экспорт содержит собственный UUIDv5 в namespace `source + external_id`.
-При отсутствии исходного ID необходим канонический HTTPS URL: он становится
-стабильным ключом `url:<URL>`. Изменение имени/родителя не меняет UUID.
-Источнику `custom` импорт запрещён: это namespace пользовательских категорий.
-Корень имеет level=1; полный путь — массив названий, без неоднозначных разделителей.
-Slug — стабильный ключ источника с SHA-256 внешнего ID, не зависит от транслитерации.
+## Подготовка файлов на aistation
 
-## Подготовка и preview — без записи категорий
-
-Поместите законный исходный файл в `.tmp/taxonomy/input.json`. Это операторский
-файл, в Git он не попадает. Для демонстрации используйте собственную фикстуру,
-только в тестовом окружении: `cp tests/fixtures/tree.json .tmp/taxonomy/input.json`.
-Не запускайте демонстрационные данные в рабочую БД вместо утверждённого каталога.
-
-Команды из корня серверного checkout после `bash scripts/up.sh`:
+Локальные пользовательские данные `data/` исключены из Git и Docker build context.
+Передайте `data/input.json` и `data/report.json` на сервер отдельно, сохранив их байты.
+После pull и `bash scripts/up.sh` из корня checkout:
 
 ```bash
 export APP_UID="$(id -u)" APP_GID="$(id -g)"
-docker compose --env-file .env.example --env-file .env run --rm --no-deps app export --input .tmp/taxonomy/input.json
-docker compose --env-file .env.example --env-file .env run --rm --no-deps app validate
-docker compose --env-file .env.example --env-file .env run --rm --no-deps app preview
-docker compose --env-file .env.example --env-file .env run --rm --no-deps app review-template
+mkdir -p .tmp/taxonomy
+cp data/input.json .tmp/taxonomy/input.json
+cp data/report.json .tmp/taxonomy/collector_report.json
+sha256sum data/input.json .tmp/taxonomy/input.json
 ```
 
-Для HTML замените первую команду на:
+Для предоставленного input.json SHA-256:
+`0d00832ab127bcfe5a56be8a55a000f05fbc451f976b0acbd9af6f94c8787803`.
+При другой версии входа значение закономерно изменится.
+
+## Preview и явный импорт
+
+Без `--apply` — только нормализация, структурная проверка и read-only preview БД:
 
 ```bash
-docker compose --env-file .env.example --env-file .env run --rm --no-deps app export --input .tmp/taxonomy/input.html --metadata .tmp/taxonomy/source.json
+docker compose --env-file .env.example --env-file .env run --rm --no-deps app import --input .tmp/taxonomy/input.json --collector-report .tmp/taxonomy/collector_report.json
 ```
 
-`categories.json`, `categories.sha256` и `raw/<sha>.<format>` образуют единый bundle.
-SHA JSON считается по каноническому JSON; raw_sha256 — по manifest, а каждый
-исходный файл имеет SHA-256 точных байтов. Bundle нужен целиком при переносе.
-Повреждение любого файла останавливает импорт. Модель плоского снимка описана
-`app/domain/taxonomy.py`; плоский JSON можно передавать `--snapshot` в validate/preview/apply.
-При ручном редактировании плоского JSON надо заново проверить дерево и сформировать
-checksum и review именно этой версии; предпочтительнее исправить первичный файл и
-повторить export. Полноту относительно внешнего сайта невозможно доказать одним флагом.
-
-В `preview` видны added/updated/skipped/retained/conflicts и план before/after.
-Это read-only транзакция: ни категории, ни снимок, ни audit run не записываются.
-
-## Ручное утверждение
-
-Скопируйте `.tmp/taxonomy/review.template.json` в `.tmp/taxonomy/review.json`.
-Сверьте полноту всех ветвей, уровни и контрольные примеры с разрешённым источником.
-Заполните `reviewed_by`, timezone-aware `reviewed_at` в ISO 8601, `reference` с
-основанием проверки. Только после проверки установите `complete: true`.
-Выборка должна охватывать каждую корневую ветвь. Шаблон по умолчанию не утверждён,
-не принимается apply и не является разрешением на сторонние материалы.
-
-Для источников с `approved`/`unverified`, а также всегда для `petrovich`, нужен
-отдельный `.tmp/taxonomy/permission.json` с полями `source`, `approved_by`,
-`approved_at`, `reference`, `allow_fetch`, `allow_reuse`. Его создают только при
-наличии реального документа; проект не создаёт фиктивных разрешений. Отсутствие
-allow_fetch не запрещает импорт отдельно законно полученного файла при allow_reuse.
-
-## Две отдельные команды после утверждения
-
-Первая явно изменяет БД только по утверждённому review:
+Для записи того же файла оператор отдельно выполняет:
 
 ```bash
-docker compose --env-file .env.example --env-file .env run --rm --no-deps app apply --review .tmp/taxonomy/review.json
+docker compose --env-file .env.example --env-file .env run --rm --no-deps app import --input .tmp/taxonomy/input.json --collector-report .tmp/taxonomy/collector_report.json --apply
 ```
 
-Вторая после завершения первой формирует SQL-отчёт и показывает его в терминале:
+`--collector-report` необязателен. Без него полнота сверх декларации input.json
+остаётся неизвестной. Ошибки JSON отчёта или неверные типы счётчиков показываются
+явной ошибкой; реальные HTTP-ошибки внутри корректного отчёта — предупреждения.
+Сборщик повторно не запускается и внешние HTTP-запросы не выполняются.
+
+В preview/apply видны before/after, added/updated/skipped/retained/conflicts,
+структурные метрики, complete, предупреждения и качество названий.
+У предоставленного отчёта отдельно учитываются 192 необработанные страницы,
+20 ошибок и 4 redirect. Эти наборы могут пересекаться и не складываются в новый
+счётчик пропусков. Пути для ошибок/redirect сопоставляются с полученным деревом;
+список URL всех 192 страниц в отчёте отсутствует, поэтому он не выдумывается.
+
+## Исходники, нормализация и качество
+
+Исходные JSON и отчёт сборщика не редактируются. Их точные байты сохраняются как
+`raw/<sha>.json` и `raw/<sha>.collector.json` рядом с `categories.json`.
+`categories.sha256` — SHA канонического снимка; `raw_sha256` — SHA manifest,
+каждый исходный файл имеет собственный SHA-256. Проверяются все исходные файлы;
+выход за пределы bundle запрещён. Старые снимки без diagnostics сохраняют прежние SHA.
+
+Пробелы в названиях нормализуются отдельно: `.tmp/taxonomy/normalization_report.json`
+содержит before/after каждой правки и причины. У текущих данных таких правок нет.
+Цены не вырезаются и имена не переименовываются по эвристике.
+Название с ценой получает `price_in_name`; признаки коллекции в имени/пути —
+`suspected_product_collection`. Они сохраняются в `categories.quality_flags`,
+снимке/аудите и отчёте, не удаляют узел и не меняют `is_active`.
+Помеченные записи имеют информационное состояние needs_review; отсутствие flags
+означает только отсутствие обнаруженных признаков, а не подтверждённую достоверность.
+Это эвристика: возможны ложные срабатывания и пропуски.
+
+Сохраняются и отдельные команды: `export --input ... --collector-report ...`,
+`validate`, `preview`, `apply` для ранее экспортированного bundle.
+`apply` не требует дополнительных файлов. Исторический `--review` необязателен,
+используется только как предоставленные оператором сведения аудита.
+Для HTML остаётся явный `ul[data-taxonomy]` с вложенными `li`, одной прямой `a`
+или `span[data-name]` и необязательным `ul` детей; `export --metadata ...` передаёт
+метаданные и фактический complete. Неизвестная вёрстка и явные `kind=product`
+не превращаются в дерево автоматически.
+
+## Атомарность, дополнение и сохранение данных
+
+Тот же ImportTree через SqlImportUnitOfWork проверяет структуру и план,
+сериализует apply, блокирует существующие строки и записывает категории,
+полный снимок, происхождение, предупреждения и audit run одной транзакцией.
+При любом сбое всё откатывается. Preview не пишет категории, снимки или audit runs.
+Файловые артефакты preview остаются в `.tmp/`.
+
+Повторный импорт не добавляет дубликаты и не обновляет timestamps неизменных строк.
+Новые дочерние категории добавляются, изменения источника обновляются.
+Исчезнувшие строки не удаляются и не деактивируются; custom сохраняются.
+Текущие imported-поля сравниваются с baseline: ручное изменение блокирует весь
+apply, вместо молчаливой перезаписи. Автоматического force/overwrite нет.
+
+Миграция `0002_partial_import` делает review в аудите nullable и добавляет
+quality_flags. Старый аудит сохраняется. Старые baseline дополняются только пустым
+набором нового поля; фактические имена и ручные изменения не подменяются.
+
+## Отчёт и проверки
+
+После импорта:
 
 ```bash
 docker compose --env-file .env.example --env-file .env run --rm --no-deps app report
 ```
 
-Отправьте `.tmp/reports/petrovich_taxonomy_import.md`. Несмотря на совместимое с ТЗ
-имя файла, внутри явно указан фактически импортированный источник.
-Для проверки идемпотентности отдельно повторите тот же apply и report: added=0,
-updated=0, количество категорий не меняется. Автоматического второго apply нет.
+Результат выводится в терминал и сохраняется в
+`.tmp/reports/petrovich_taxonomy_import.md`: SQL counts, корни, листья, глубина,
+уровни, ветви, дубли/циклы/потерянные родители, качество, complete и отчёт сборщика,
+источник/лицензия, SHA исходника и снимка, до/после и история реальных операций.
+Повтор распознаётся также по SHA исходного JSON: время нового экспорта не мешает
+показать нулевые added/updated. Неполнота не превращает успешную загрузку в BLOCKED.
 
-Каждый apply атомарен: категории + полный снимок + review + условия использования
-+ счётчики + commit SHA. Изменённые строки сравниваются с последним imported_values.
-При ручной правке операция целиком блокируется; оператор разбирает конфликт отдельно.
-Автоматического force/overwrite нет. Исчезнувшие категории и custom сохраняются.
-Полный снимок и лицензия остаются в `taxonomy_snapshots.payload`; история —
-`taxonomy_import_runs`. SQL хранится только в infrastructure; UoW фиксируется use-case.
+Ручная проверка: db-check → ready; первый apply пустой БД → 2775 добавленных;
+повтор → added=0, updated=0, skipped=2775; roots=9, max_depth=5, leaves=2313;
+уровни 9/151/1056/1328/231. Структурных ошибок — 0. Ожидаются предупреждения
+192/20/4 и признаки качества; они не означают проверенную полноту сайта.
+Отрицательные сценарии с циклами/родителями проверяйте в отдельной тестовой БД.
+HTTP/UI на этом этапе нет.
 
-Отчёт включает counts, корни, листья, глубину, уровни и корневые ветви, дубли,
-циклы, потерянных родителей, недостижимые узлы, источники, до/после каждого apply,
-добавлено/обновлено/пропущено/сохранено, review и результаты реальных повторов.
-Наличие JUnit подтверждает только соответствующий тестовый запуск, не production import.
+## Deploy, backup и диагностика
 
-## БД, backup и диагностика
+`bash scripts/up.sh` собирает только проектный CLI, запускает проектную БД,
+применяет миграции и проверяет SQL. Категории автоматически не загружаются.
+`bash scripts/test.sh` — полный изолированный PostgreSQL-прогон;
+`./ops/check-quality.ps1 -Integration` — Windows gate.
 
-Нет HTTP/UI и опубликованных портов. Readiness-эквивалент этого CLI-этапа:
-
-```bash
-docker compose --env-file .env.example --env-file .env ps
-docker compose --env-file .env.example --env-file .env run --rm --no-deps app db-check
-```
-
-Ожидается `status=ready`, миграция `0001_taxonomy`. Перед будущими изменениями
-заполненной schema сохраните backup отдельно от Git:
+Перед миграцией заполненной БД сохраните backup отдельно от Git:
 
 ```bash
 mkdir -p .tmp/backups
 docker compose --env-file .env.example --env-file .env exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' > ".tmp/backups/catalog-$(date -u +%Y%m%dT%H%M%SZ).dump"
 ```
 
-Начальная миграция создаёт только свои таблицы. Автоматический destructive downgrade
-запрещён; откат заполненной БД — отдельная процедура восстановления проверенного backup.
-Не удаляйте production volume. Повторный up.sh не ротирует секрет и не очищает данные.
+Readiness: `docker compose --env-file .env.example --env-file .env run --rm --no-deps app db-check`
+→ ready, revision=0002_partial_import. Повторный up.sh сохраняет данные и пароль.
+Destructive downgrade запрещён; восстановление backup — отдельная операторская процедура.
+Shared-сервисы, сети и host ports не изменяются.
 
-Petrovich adapter требует реального permission, разрешающий robots.txt, публичный
-DNS, ограниченные retry/timeout/размер и паузу. 401/403/429/redirect — немедленный BLOCKED,
-без cookies/IP/proxy обходов. Реализован только root-запрос для будущего исследования,
-не массовый обход. Полнота реального каталога и фактическая HTML-вёрстка не подтверждены.
+Petrovich HTTP adapter по-прежнему требует разрешённый доступ, соблюдает robots,
+allowlist/DNS, timeout/retry/размер/паузу и останавливается при 401/403/429/redirect.
+Этот адаптер не используется импортом локальных файлов и в текущей задаче не запускался.

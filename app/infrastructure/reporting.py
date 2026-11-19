@@ -4,7 +4,7 @@
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
-from app.infrastructure.database import import_runs, snapshots
+from app.infrastructure.database import categories, import_runs, snapshots
 
 TREE_SQL = """
 WITH RECURSIVE tree AS (
@@ -75,6 +75,21 @@ class SqlReportRepository:
                     counts[k]
                     for k in ("cycles", "duplicates", "orphans", "unreachable", "empty_names")
                 )
+                quality_nodes = [
+                    dict(row)
+                    for row in conn.execute(
+                        sa.select(
+                            categories.c.id,
+                            categories.c.external_id,
+                            categories.c.name,
+                            categories.c.source,
+                            categories.c.quality_flags,
+                        )
+                        .where(categories.c.quality_flags != [])
+                        .order_by(categories.c.source, categories.c.external_id)
+                    ).mappings()
+                ]
+                counts["suspected_categories"] = len(quality_nodes)
                 sources = [
                     dict(r)
                     for r in conn.execute(
@@ -103,4 +118,5 @@ class SqlReportRepository:
                     "sources": sources,
                     "history": history,
                     "snapshots": saved,
+                    "quality_nodes": quality_nodes,
                 }

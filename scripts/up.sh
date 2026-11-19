@@ -19,4 +19,4 @@ docker info --format 'Docker server: {{.ServerVersion}}'
 "${dc[@]}" run --rm --no-deps --entrypoint /app/.tmp/venv/bin/python app -m alembic upgrade head
 "${dc[@]}" run --rm --no-deps app db-check
 "${dc[@]}" ps
-printf '%s\n' 'БД готова. Категории не загружались; apply запускается отдельно после preview/review.'
+printf '%s\n' 'БД готова. Для загрузки локального дерева запустите import --input ... --apply.'
