@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "contract_name": "category_retrieval_v1",
+  "model_logical_name": "shared-embedding",
+  "configured_embedding_model": "Qwen/Qwen3-VL-Embedding-8B",
+  "embedding_dimensions": 4096,
+  "distance": "Cosine",
+  "vector_name": "dense",
+  "collection_alias": "product_taxonomy_categories_active",
+  "point_id": "categories.id (UUID, unchanged)",
+  "category_document": {
+    "template_version": "category_doc_v1",
+    "template": "Категория: {category_name}\nПолный путь: {full_path}\nСинонимы: {approved_aliases}\nОписание: {reviewed_description}\nНазначение: {reviewed_purpose}\nИсключения: {reviewed_exclusions}",
+    "data_only": [
+      "category_name",
+      "full_path",
+      "approved_aliases",
+      "reviewed_description",
+      "reviewed_purpose",
+      "reviewed_exclusions"
+    ],
+    "missing_text_placeholder": "не указано",
+    "approved_aliases_only": true,
+    "notes": "Описание/исключения не генерировать без проверки; вход в эмбеддинг сериализовать одинаково при каждом экспорте."
+  },
+  "query_document": {
+    "template_version": "product_query_v1",
+    "template": "Тип изделия: {product_type}\nБолее общий тип: {generic_type}\nНазначение: {purpose}\nПрименение: {applications}\nКлючевые характеристики: {type_disambiguating_attributes}",
+    "do_not_include": [
+      "price",
+      "seller",
+      "raw_html",
+      "unrelated_url",
+      "model_uncorroborated_facts"
+    ]
+  },
+  "payload": {
+    "category_id": "UUID",
+    "parent_id": "UUID|null",
+    "path_ids": "UUID[]",
+    "path_names": "string[]",
+    "depth": "int",
+    "name": "string",
+    "is_active": "bool",
+    "is_assignable": "bool",
+    "review_status": "string",
+    "source": "string",
+    "document_sha256": "hex64",
+    "taxonomy_revision": "int",
+    "aliases_version": "string",
+    "document_version": "category_doc_v1",
+    "embedding_model_revision": "string",
+    "embedding_dimensions": "int"
+  },
+  "retrieval": {
+    "dense_top_k": 20,
+    "lexical_top_k": 20,
+    "vlm_candidate_limit": 10,
+    "fusion": "RRF",
+    "include_valid_ancestors": true,
+    "require_is_active": true,
+    "require_is_assignable": true,
+    "mandatory_post_filter": "Re-read category from PostgreSQL before selecting",
+    "fallback": "If Qdrant unavailable or stale use PostgreSQL lexical retrieval and needs_review"
+  },
+  "synchronization": {
+    "source_of_truth": "PostgreSQL",
+    "mechanism": "transactional_outbox + idempotent worker + periodic reconciliation",
+    "periodic_reconciliation_seconds": 900,
+    "startup_reconciliation": true,
+    "point_upsert_on": [
+      "category_insert",
+      "category_update",
+      "alias_change",
+      "description_change",
+      "is_assignable_change",
+      "status_change"
+    ],
+    "subtree_reindex_on": [
+      "name_change",
+      "parent_id_change",
+      "parent_name_change"
+    ],
+    "point_delete_on": [
+      "category_delete",
+      "is_active_false"
+    ],
+    "rebuild_on": [
+      "model_change",
+      "dimension_change",
+      "document_schema_change",
+      "outbox_gap"
+    ],
+    "versioned_collections": true,
+    "atomic_alias_switch": true
+  }
+}

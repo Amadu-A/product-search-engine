@@ -1,0 +1,54 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": [
+        "selected",
+        "needs_review",
+        "no_suitable_category"
+      ]
+    },
+    "category_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "selection_type": {
+      "type": "string",
+      "enum": [
+        "exact",
+        "broader",
+        "none"
+      ]
+    },
+    "reason": {
+      "type": "string"
+    },
+    "supporting_evidence_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "compared_candidate_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "status",
+    "category_id",
+    "selection_type",
+    "reason",
+    "supporting_evidence_ids",
+    "compared_candidate_ids"
+  ],
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:product-search:answer-2:v1",
+  "title": "CategorySelectionAnswerV1"
+}

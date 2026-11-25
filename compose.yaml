@@ -1,11 +1,108 @@
 # compose.yaml
-# Только проектная PostgreSQL и одноразовый CLI; host ports и shared-зависимости не нужны.
+# Только собственные PostgreSQL/Qdrant/API/workers; shared сервисы не пересоздаются.
 name: product-search-engine
 x-logging: &logging
   driver: local
-  options:
-    max-size: "10m"
-    max-file: "5"
+  options: {max-size: "10m", max-file: "5"}
+x-runtime: &runtime
+  image: product-search-engine:local
+  build:
+    context: .
+    target: runtime
+    args:
+      PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.12-slim}
+      VCS_REF: ${VCS_REF:-unknown}
+  user: "${APP_UID:-1000}:${APP_GID:-1000}"
+  environment:
+    POSTGRES_HOST: "postgres"
+    POSTGRES_PORT: "5432"
+    POSTGRES_DB: "${POSTGRES_DB:-product_search}"
+    POSTGRES_USER: "${POSTGRES_USER:-product_search_app}"
+    POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Заполните POSTGRES_PASSWORD в приватном .env}"
+    DB_CONNECT_TIMEOUT: "${DB_CONNECT_TIMEOUT:-5}"
+    DB_STATEMENT_TIMEOUT_MS: "${DB_STATEMENT_TIMEOUT_MS:-30000}"
+    SOURCE_BASE_URL: "${SOURCE_BASE_URL:-https://petrovich.ru}"
+    SOURCE_CATALOG_PATH: "${SOURCE_CATALOG_PATH:-/catalog/}"
+    HTTP_USER_AGENT: "${HTTP_USER_AGENT:-ProductSearchTaxonomy/0.1}"
+    HTTP_TIMEOUT_SECONDS: "${HTTP_TIMEOUT_SECONDS:-20.0}"
+    HTTP_MAX_RESPONSE_BYTES: "${HTTP_MAX_RESPONSE_BYTES:-8388608}"
+    SNAPSHOT_MAX_BYTES: "${SNAPSHOT_MAX_BYTES:-67108864}"
+    HTTP_MIN_INTERVAL_SECONDS: "${HTTP_MIN_INTERVAL_SECONDS:-2.0}"
+    HTTP_RETRIES: "${HTTP_RETRIES:-2}"
+    TAXONOMY_MAX_NODES: "${TAXONOMY_MAX_NODES:-20000}"
+    TAXONOMY_MAX_DEPTH: "${TAXONOMY_MAX_DEPTH:-32}"
+    ARTIFACT_DIR: "${ARTIFACT_DIR:-.tmp/taxonomy}"
+    PERMISSION_FILE: "${PERMISSION_FILE:-.tmp/taxonomy/permission.json}"
+    REPORT_FILE: "${REPORT_FILE:-.tmp/reports/petrovich_taxonomy_import.md}"
+    LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+    VCS_REF: "${VCS_REF:-unknown}"
+    APP_UID: "${APP_UID:-1000}"
+    APP_GID: "${APP_GID:-1000}"
+    POSTGRES_IMAGE: "${POSTGRES_IMAGE:-postgres:16.15-alpine}"
+    PYTHON_IMAGE: "${PYTHON_IMAGE:-python:3.12-slim}"
+    POSTGRES_MEMORY_LIMIT: "${POSTGRES_MEMORY_LIMIT:-512m}"
+    APP_MEMORY_LIMIT: "${APP_MEMORY_LIMIT:-512m}"
+    INFERENCE_MODE: "${INFERENCE_MODE:-live}"
+    JOB_TRANSPORT: "${JOB_TRANSPORT:-rabbitmq}"
+    SHARED_VLM_BASE_URL: "${SHARED_VLM_BASE_URL:-http://shared-vlm:8000/v1}"
+    SHARED_VLM_MODEL: "${SHARED_VLM_MODEL:-shared-vlm}"
+    SHARED_VLM_MODEL_REVISION: "${SHARED_VLM_MODEL_REVISION:-unverified}"
+    SHARED_EMBEDDING_BASE_URL: "${SHARED_EMBEDDING_BASE_URL:-http://shared-embedding:8000/v1}"
+    SHARED_EMBEDDING_MODEL: "${SHARED_EMBEDDING_MODEL:-shared-embedding}"
+    SHARED_EMBEDDING_MODEL_REVISION: "${SHARED_EMBEDDING_MODEL_REVISION:-unverified}"
+    INFERENCE_TIMEOUT_SECONDS: "${INFERENCE_TIMEOUT_SECONDS:-90.0}"
+    READINESS_TIMEOUT_SECONDS: "${READINESS_TIMEOUT_SECONDS:-5.0}"
+    INFERENCE_RETRIES: "${INFERENCE_RETRIES:-1}"
+    INFERENCE_CONCURRENCY: "${INFERENCE_CONCURRENCY:-2}"
+    INFERENCE_MAX_TOKENS: "${INFERENCE_MAX_TOKENS:-1200}"
+    INFERENCE_MAX_INPUT_CHARS: "${INFERENCE_MAX_INPUT_CHARS:-16000}"
+    QDRANT_URL: "${QDRANT_URL:-http://qdrant:6333}"
+    QDRANT_API_KEY: "${QDRANT_API_KEY:-}"
+    QDRANT_COLLECTION_ALIAS: "${QDRANT_COLLECTION_ALIAS:-product_taxonomy_categories_active}"
+    QDRANT_IMAGE: "${QDRANT_IMAGE:-qdrant/qdrant:v1.19.0}"
+    QDRANT_TIMEOUT_SECONDS: "${QDRANT_TIMEOUT_SECONDS:-15.0}"
+    EMBEDDING_DIMENSIONS: "${EMBEDDING_DIMENSIONS:-4096}"
+    MOCK_EMBEDDING_DIMENSIONS: "${MOCK_EMBEDDING_DIMENSIONS:-64}"
+    EMBEDDING_BATCH_SIZE: "${EMBEDDING_BATCH_SIZE:-32}"
+    TAXONOMY_RECONCILE_INTERVAL_SECONDS: "${TAXONOMY_RECONCILE_INTERVAL_SECONDS:-900}"
+    TAXONOMY_INDEX_WORKER_ENABLED: "${TAXONOMY_INDEX_WORKER_ENABLED:-true}"
+    CATEGORY_CANDIDATE_TOP_K: "${CATEGORY_CANDIDATE_TOP_K:-10}"
+    TAXONOMY_OUTBOX_MAX_ATTEMPTS: "${TAXONOMY_OUTBOX_MAX_ATTEMPTS:-5}"
+    RABBITMQ_HOST: "${RABBITMQ_HOST:-rabbitmq}"
+    RABBITMQ_PORT: "${RABBITMQ_PORT:-5672}"
+    RABBITMQ_USER: "${RABBITMQ_USER:-product_search_engine_app}"
+    RABBITMQ_VHOST: "${RABBITMQ_VHOST:-product-search-engine}"
+    RABBITMQ_PASSWORD: "${RABBITMQ_PASSWORD:-}"
+    RABBITMQ_QUEUE: "${RABBITMQ_QUEUE:-product-search-engine.ingest.v1}"
+    WORKER_CONCURRENCY: "${WORKER_CONCURRENCY:-2}"
+    WORKER_POLL_SECONDS: "${WORKER_POLL_SECONDS:-1.0}"
+    WORKER_LEASE_SECONDS: "${WORKER_LEASE_SECONDS:-300}"
+    UPLOAD_DIR: "${UPLOAD_DIR:-.tmp/uploads}"
+    UPLOAD_MAX_BYTES: "${UPLOAD_MAX_BYTES:-52428800}"
+    UPLOAD_MAX_ROWS: "${UPLOAD_MAX_ROWS:-100000}"
+    UPLOAD_MAX_FILES: "${UPLOAD_MAX_FILES:-10}"
+    UPLOAD_PREVIEW_ROWS: "${UPLOAD_PREVIEW_ROWS:-20}"
+    UPLOAD_MAX_FIELD_CHARS: "${UPLOAD_MAX_FIELD_CHARS:-10000}"
+    UPLOAD_MAX_SHEETS: "${UPLOAD_MAX_SHEETS:-20}"
+    UPLOAD_MAX_CELLS: "${UPLOAD_MAX_CELLS:-2000000}"
+    UPLOAD_ZIP_MAX_BYTES: "${UPLOAD_ZIP_MAX_BYTES:-268435456}"
+    UPLOAD_ZIP_MAX_RATIO: "${UPLOAD_ZIP_MAX_RATIO:-100}"
+    UPLOAD_TTL_SECONDS: "${UPLOAD_TTL_SECONDS:-86400}"
+    HTTP_BIND_IP: "${HTTP_BIND_IP:-127.0.0.1}"
+    HTTP_HOST_PORT: "${HTTP_HOST_PORT:-0}"
+    API_PORT: "${API_PORT:-8000}"
+    API_MEMORY_LIMIT: "${API_MEMORY_LIMIT:-1g}"
+    WORKER_MEMORY_LIMIT: "${WORKER_MEMORY_LIMIT:-2g}"
+    QDRANT_MEMORY_LIMIT: "${QDRANT_MEMORY_LIMIT:-1g}"
+    LIVE_SMOKE_ENABLED: "${LIVE_SMOKE_ENABLED:-false}"
+  volumes:
+    - ./.tmp/taxonomy:/app/.tmp/taxonomy
+    - ./.tmp/reports:/app/.tmp/reports
+    - ./.tmp/uploads:/app/.tmp/uploads
+  networks: [private, egress, shared]
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  logging: *logging
 services:
   postgres:
     image: ${POSTGRES_IMAGE:-postgres:16.15-alpine}
@@ -14,8 +111,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-product_search}
       POSTGRES_USER: ${POSTGRES_USER:-product_search_app}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Заполните POSTGRES_PASSWORD в приватном .env}
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
+    volumes: [postgres-data:/var/lib/postgresql/data]
     networks: [private]
     mem_limit: ${POSTGRES_MEMORY_LIMIT:-512m}
     logging: *logging
@@ -24,53 +120,47 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
-  app:
-    image: product-search-engine:local
-    profiles: [tools]
-    build:
-      context: .
-      target: runtime
-      args:
-        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.12-slim}
-        VCS_REF: ${VCS_REF:-unknown}
-    user: "${APP_UID:-1000}:${APP_GID:-1000}"
-    env_file:
-      - .env.example
-      - path: .env
-        required: false
-    environment:
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: "5432"
-      POSTGRES_DB: ${POSTGRES_DB:-product_search}
-      POSTGRES_USER: ${POSTGRES_USER:-product_search_app}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Заполните POSTGRES_PASSWORD в приватном .env}
-      DB_CONNECT_TIMEOUT: ${DB_CONNECT_TIMEOUT:-5}
-      DB_STATEMENT_TIMEOUT_MS: ${DB_STATEMENT_TIMEOUT_MS:-30000}
-      SOURCE_BASE_URL: ${SOURCE_BASE_URL:-https://petrovich.ru}
-      SOURCE_CATALOG_PATH: ${SOURCE_CATALOG_PATH:-/catalog/}
-      HTTP_USER_AGENT: ${HTTP_USER_AGENT:-ProductSearchTaxonomy/0.1}
-      HTTP_TIMEOUT_SECONDS: ${HTTP_TIMEOUT_SECONDS:-20}
-      HTTP_MAX_RESPONSE_BYTES: ${HTTP_MAX_RESPONSE_BYTES:-8388608}
-      SNAPSHOT_MAX_BYTES: ${SNAPSHOT_MAX_BYTES:-67108864}
-      HTTP_MIN_INTERVAL_SECONDS: ${HTTP_MIN_INTERVAL_SECONDS:-2}
-      HTTP_RETRIES: ${HTTP_RETRIES:-2}
-      TAXONOMY_MAX_NODES: ${TAXONOMY_MAX_NODES:-20000}
-      TAXONOMY_MAX_DEPTH: ${TAXONOMY_MAX_DEPTH:-32}
-      ARTIFACT_DIR: ${ARTIFACT_DIR:-.tmp/taxonomy}
-      PERMISSION_FILE: ${PERMISSION_FILE:-.tmp/taxonomy/permission.json}
-      REPORT_FILE: ${REPORT_FILE:-.tmp/reports/petrovich_taxonomy_import.md}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-    volumes:
-      - ./.tmp/taxonomy:/app/.tmp/taxonomy
-      - ./.tmp/reports:/app/.tmp/reports
-    networks: [private, egress]
-    mem_limit: ${APP_MEMORY_LIMIT:-512m}
-    cap_drop: [ALL]
-    security_opt: [no-new-privileges:true]
+  qdrant:
+    image: ${QDRANT_IMAGE:-qdrant/qdrant:v1.19.0}
+    restart: unless-stopped
+    volumes: [qdrant-data:/qdrant/storage]
+    networks: [private]
     logging: *logging
+    mem_limit: ${QDRANT_MEMORY_LIMIT:-1g}
+  app:
+    <<: *runtime
+    profiles: [tools]
+    mem_limit: ${APP_MEMORY_LIMIT:-512m}
+  api:
+    <<: *runtime
+    command: [serve]
+    restart: unless-stopped
+    mem_limit: ${API_MEMORY_LIMIT:-1g}
+    ports: ["${HTTP_BIND_IP:-127.0.0.1}:${HTTP_HOST_PORT:-0}:${API_PORT:-8000}"]
+    healthcheck:
+      test: [CMD, /app/.tmp/venv/bin/python, -c, "import httpx,os; r=httpx.get('http://127.0.0.1:'+os.getenv('API_PORT','8000')+'/health/ready', timeout=15); r.raise_for_status()"]
+      interval: 20s
+      timeout: 20s
+      start_period: 120s
+      retries: 30
+  worker:
+    <<: *runtime
+    command: [worker]
+    restart: unless-stopped
+    mem_limit: ${WORKER_MEMORY_LIMIT:-2g}
+    healthcheck:
+      test: [CMD, /app/.tmp/venv/bin/python, -c, "import time,pathlib; p=pathlib.Path('.tmp/reports/worker-heartbeat'); assert p.exists() and time.time()-p.stat().st_mtime<600"]
+      interval: 30s
+      timeout: 5s
+      start_period: 120s
+      retries: 10
 networks:
   private:
     internal: true
   egress: {}
+  shared:
+    external: true
+    name: ai-shared
 volumes:
   postgres-data: {}
+  qdrant-data: {}

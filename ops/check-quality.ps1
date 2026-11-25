@@ -27,7 +27,7 @@ if ($Integration) {
     try {
         Invoke-Checked 'docker' ($composeArgs + @('config', '--quiet'))
         Invoke-Checked 'docker' ($composeArgs + @('build', 'tests'))
-        Invoke-Checked 'docker' ($composeArgs + @('up', '-d', '--wait', '--wait-timeout', '120', 'test-postgres'))
+        Invoke-Checked 'docker' ($composeArgs + @('up', '-d', '--wait', '--wait-timeout', '120', 'test-postgres', 'test-qdrant'))
         Invoke-Checked 'docker' ($composeArgs + @('run', '--rm', '--no-deps', 'tests'))
     } finally {
         & docker @composeArgs down

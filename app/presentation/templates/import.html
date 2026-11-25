@@ -1,0 +1,54 @@
+<!-- app/presentation/templates/import.html -->
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Импорт номенклатуры · Product Search Engine</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+  <script type="module" src="/static/js/workspace.js"></script>
+</head>
+<body data-mode="{{ mode }}" data-mobile-tab="file">
+<header class="header"><a class="header__brand" href="/admin/import"><span aria-hidden="true">◈</span> Product Search Engine</a>
+  <nav aria-label="Разделы"><button type="button" data-view="import" aria-current="page">Импорт</button><button type="button" data-view="categories">Категории</button><button type="button" data-view="review">Проверка</button><button type="button" data-view="history">История</button></nav>
+  <a href="/docs">Swagger ↗</a><span id="index-status" role="status">Индекс: проверка…</span>
+</header>
+<div id="notice" class="notice" role="status" aria-live="polite"></div>
+{% if mode == 'mock' %}<div class="mode">MOCK — изолированный тестовый inference. Ответы моделей не проверены.</div>{% endif %}
+<main class="workspace" id="import-view">
+  <nav class="mobile-tabs" aria-label="Панели импорта"><button type="button" data-mobile-tab="file" aria-pressed="true">Файл</button><button type="button" data-mobile-tab="processing" aria-pressed="false">Обработка</button><button type="button" data-mobile-tab="review" aria-pressed="false">На проверке</button><button type="button" data-mobile-tab="categories" aria-pressed="false">Категории</button></nav>
+  <aside class="panel upload"><h1>Импорт номенклатуры</h1><p class="muted">Загрузите каталог, проверьте результаты и назначьте категории.</p>
+    <form id="upload-form">
+      <div class="upload__drop" id="drop-zone"><span aria-hidden="true" class="upload__icon">⇧</span><strong>Перетащите файлы сюда</strong><span>или выберите на компьютере</span><label class="button" for="files">Выбрать файлы</label><input id="files" name="files" type="file" accept=".json,.xml,.xlsx,.csv" multiple required></div>
+      <p class="muted">JSON · XML · XLSX · CSV<br>До 50 МиБ на файл, 10 файлов, 100 000 строк.</p>
+      <a href="/import-formats" target="_blank" rel="noopener">Форматы файлов и примеры ↗</a>
+      <p class="muted">Скачать шаблон: <a href="/api/v1/import-templates/json">JSON</a> · <a href="/api/v1/import-templates/xml">XML</a> · <a href="/api/v1/import-templates/xlsx">XLSX</a> · <a href="/api/v1/import-templates/csv">CSV</a></p>
+      <details><summary>Параметры CSV / XLSX</summary><label>Кодировка<select id="encoding"><option value="utf-8-sig">UTF-8 / BOM</option><option value="cp1251">Windows-1251 (явно)</option></select></label><label>Разделитель<select id="delimiter"><option value="">Определить</option value=";">;</option><option value=",">,</option><option value="tab">Табуляция</option></select></label><label>Строка заголовков<input id="header-row" type="number" min="1" max="1000" value="1"></label></details>
+      <label class="check"><input id="auto-start" type="checkbox" checked> Начать после однозначного preview</label>
+      <label>Источник для CSV / XLSX / массива JSON<input id="source-name" maxlength="128" placeholder="По умолчанию: имя файла"></label>
+      <button class="button button--primary" type="submit" id="upload-button">Загрузить и проверить</button>
+    </form>
+    <section id="preview" hidden><h2>Предварительный просмотр</h2><div id="preview-files"></div><details id="mapping-options"><summary>Сопоставление полей</summary><div id="mapping-fields"></div></details><label id="sheet-label" hidden>Листы (через запятую)<input id="sheets"></label><label class="check"><input id="save-profile" type="checkbox"> Сохранить профиль для этих файлов</label><button type="button" id="mapping-button">Подтвердить сопоставление</button><button class="button button--primary" type="button" id="start-button">Начать обработку</button></section>
+  </aside>
+  <div class="workspace__main">
+    <section class="panel progress"><div class="section-heading"><h2>Обработка номенклатуры</h2><span id="progress-label">Загрузите файл</span></div><progress id="progress" value="0" max="100">0%</progress>
+      <div class="progress__controls"><span id="job-status">Нет задания</span><button type="button" id="cancel-button" disabled>Остановить</button><button type="button" id="resume-button" disabled>Продолжить</button><a id="report-json" hidden>Отчёт JSON</a><a id="report-csv" hidden>CSV</a></div>
+      <div class="toolbar"><label>События<select id="event-filter"><option value="all">Все</option><option value="success">Успешные</option><option value="warning">На проверке</option><option value="error">Ошибки</option></select></label><label>Поиск в ленте<input id="event-search" type="search" placeholder="Имя или record_id"></label></div>
+      <ol id="events" class="events" aria-label="События обработки"></ol>
+      <div class="counters"><div class="counter counter--ok">Назначено<strong id="assigned-count">0</strong></div><div class="counter counter--review">На проверке<strong id="review-count">0</strong></div><div class="counter counter--gap">Нет категории<strong id="gap-count">0</strong></div><div class="counter">Ошибки<strong id="error-count">0</strong></div></div>
+    </section>
+    <section class="panel review"><div class="section-heading"><h2>Позиции и ручная проверка</h2><span id="items-total">0 позиций</span></div>
+      <div class="toolbar"><label>Поиск<input id="item-search" type="search" placeholder="Наименование"></label><label>Статус<select id="item-status"><option value="">Все</option><option value="needs_review">На проверке</option><option value="taxonomy_gap">Нет категории</option><option value="assigned">Назначено</option><option value="not_product">Не товар</option><option value="invalid_record">Некорректные</option><option value="error">Ошибки</option></select></label></div>
+      <button id="bulk-preview" type="button" disabled>Назначить выбранным (0)</button>
+      <div class="review__panes"><div class="review__list"><div class="table-wrap"><table><thead><tr><th aria-label="Выбор"></th><th>Наименование</th><th>Статус</th><th>Категория</th></tr></thead><tbody id="items"></tbody></table></div><div class="pagination"><button id="previous" type="button">←</button><span id="page-label">1</span><button id="next" type="button">→</button></div></div>
+        <section class="review__details" aria-label="Данные позиции"><h3 id="detail-title">Выберите позицию</h3><p id="detail-summary" class="muted">Raw, нормализация, ответы и решения сохраняются раздельно.</p><div id="detail-issues"></div><details><summary>Исходная запись</summary><pre id="detail-raw"></pre></details><details><summary>Ответы и история решений</summary><pre id="detail-trace"></pre></details><div class="review__identity"><button id="confirm-product" disabled type="button">Подтвердить Product</button><button id="reject-product" disabled type="button">Не объединять</button></div></section>
+        <section class="review__tree" aria-label="Выбор категории"><h3>Назначить категорию</h3><label>Поиск в дереве<input id="category-search" type="search" placeholder="Название или путь"></label><div id="category-tree" class="tree" role="group" aria-label="Дерево категорий"></div><p id="selected-category" class="muted">Категория не выбрана</p><label>Основание решения<input id="decision-reason" maxlength="2000" placeholder="Почему подходит категория"></label><button id="assign-button" class="button button--primary" type="button" disabled>Назначить категорию</button><button id="new-category" type="button">+ Создать категорию</button></section>
+      </div>
+      <div class="toolbar"><button id="confirm-proposal" disabled type="button">Подтвердить предложение</button><button id="mark-not-product" disabled type="button">Не является товаром</button><button id="leave-uncategorized" disabled type="button">Оставить без категории</button></div>
+    </section>
+  </div>
+</main>
+<dialog id="bulk-dialog"><h2>Проверить пакетное назначение</h2><p id="bulk-target"></p><ul id="bulk-items"></ul><button id="bulk-cancel" type="button">Отмена</button><button id="bulk-confirm" class="button button--primary" type="button">Подтвердить назначение выбранным</button></dialog>
+<section id="history-view" class="panel alternate" hidden><h1>История импортов</h1><div id="history"></div></section>
+<section id="categories-view" class="panel alternate" hidden><div class="section-heading"><h1>Категории</h1><button id="reindex-button" type="button">Синхронизировать индекс</button></div><p>UUID и родительские связи хранятся в PostgreSQL. Индекс — восстанавливаемая проекция.</p><div id="all-categories"></div></section>
+<dialog id="category-dialog"><form id="category-form"><h2>Новая категория</h2><label>Название<input id="category-name" required maxlength="512"></label><label>Родитель<select id="category-parent"><option value="">Корневая категория</option></select></label><label class="check"><input id="category-assignable" type="checkbox" checked> Разрешено назначать товары</label><label>Описание<textarea id="category-description" maxlength="10000"></textarea></label><label>Назначение<textarea id="category-purpose" maxlength="10000"></textarea></label><label>Исключения<textarea id="category-exclusions" maxlength="10000"></textarea></label><label>Основание<input id="category-reason" required maxlength="2000"></label><div class="toolbar"><button type="button" id="close-dialog">Отмена</button><button class="button button--primary" type="submit">Создать категорию</button></div></form></dialog>
+</body></html>

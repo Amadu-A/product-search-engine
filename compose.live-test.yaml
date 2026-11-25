@@ -1,0 +1,22 @@
+# compose.live-test.yaml
+# Реальные shared-модели, изолированные SQL/Qdrant; production данные не изменяются.
+services:
+  tests:
+    environment:
+      INFERENCE_MODE: live
+      LIVE_SMOKE_ENABLED: "true"
+      JOB_TRANSPORT: postgres
+      SHARED_VLM_BASE_URL: ${SHARED_VLM_BASE_URL:-http://shared-vlm:8000/v1}
+      SHARED_EMBEDDING_BASE_URL: ${SHARED_EMBEDDING_BASE_URL:-http://shared-embedding:8000/v1}
+      SHARED_VLM_MODEL_REVISION: ${SHARED_VLM_MODEL_REVISION:-unverified}
+      SHARED_EMBEDDING_MODEL_REVISION: ${SHARED_EMBEDDING_MODEL_REVISION:-unverified}
+    networks: [test, shared]
+    mem_limit: 3g
+  test-postgres:
+    mem_limit: 512m
+  test-qdrant:
+    mem_limit: 1g
+networks:
+  shared:
+    external: true
+    name: ai-shared

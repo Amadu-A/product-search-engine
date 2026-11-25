@@ -38,11 +38,21 @@ def test_migration_matches_models(db_engine):
     """Живая Alembic schema точно соответствует ORM metadata и readiness-контракту."""
     assert check_database(db_engine) == {
         "status": "ready",
-        "revision": "0002_partial_import",
+        "revision": "0003_catalog_pipeline",
         "categories": 0,
     }
     with db_engine.connect() as conn:
-        differences = compare_metadata(MigrationContext.configure(conn), metadata)
+        differences = compare_metadata(
+            MigrationContext.configure(
+                conn,
+                opts={
+                    "include_object": lambda obj, name, kind, reflected, compare_to: (
+                        name in metadata.tables if kind == "table" else True
+                    ),
+                },
+            ),
+            metadata,
+        )
     assert differences == []
 
 

@@ -27,14 +27,35 @@ services:
         PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.12-slim}
     environment:
       TEST_DATABASE_URL: postgresql+psycopg://taxonomy_test:synthetic-test-only@test-postgres/taxonomy_test
+      QDRANT_URL: http://test-qdrant:6333
+      INFERENCE_MODE: mock
+      JOB_TRANSPORT: postgres
+      PLAYWRIGHT_BROWSERS_PATH: /app/.tmp/playwright
     volumes:
+      - ./app:/app/app:ro
+      - ./tests:/app/tests:ro
+      - ./migrations:/app/migrations:ro
+      - ./docs:/app/docs:ro
+      - ./.env.example:/app/.env.example:ro
       - ./.tmp/reports:/app/.tmp/reports
       - ./.tmp/coverage:/app/.tmp/coverage
+      - ./.tmp/browser:/app/.tmp/browser
+      - ./examples:/app/examples:ro
+      - ./data/fixtures:/app/data/fixtures:ro
     networks: [test]
     depends_on:
       test-postgres:
         condition: service_healthy
+      test-qdrant:
+        condition: service_started
     command: [-m, pytest, --junitxml=.tmp/reports/pytest-linux.xml, --cov=app, --cov-report=term, --cov-report=xml]
+  test-qdrant:
+    image: ${QDRANT_IMAGE:-qdrant/qdrant:v1.19.0}
+    tmpfs: [/qdrant/storage]
+    networks: [test]
+    logging:
+      driver: local
+      options: {max-size: 10m, max-file: "3"}
 networks:
   test:
     internal: true

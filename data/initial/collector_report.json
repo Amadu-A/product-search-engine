@@ -1,0 +1,160 @@
+{
+  "schema": "petrovich-browser-collector-report-v2",
+  "started_at": "2026-11-18T11:03:16.112Z",
+  "updated_at": "2026-11-18T13:55:57.636Z",
+  "root_url": "https://petrovich.ru/catalog/",
+  "roots": [
+    "Стройматериалы",
+    "Инструмент",
+    "Электрика",
+    "Инженерные системы",
+    "Финишная отделка",
+    "Товары для дома",
+    "Сантехника",
+    "Крепеж",
+    "Сад и досуг"
+  ],
+  "categories": 2775,
+  "levels": {
+    "1": 9,
+    "2": 151,
+    "3": 1056,
+    "4": 1328,
+    "5": 231
+  },
+  "fetched_pages": 2559,
+  "remaining_pages": 192,
+  "errors": [
+    {
+      "url": "https://petrovich.ru/catalog/285395791/",
+      "error": "HTTP 503",
+      "at": "2026-11-18T12:18:32.251Z"
+    },
+    {
+      "url": "https://petrovich.ru/catalog/285396862/",
+      "error": "HTTP 503",
+      "at": "2026-11-18T12:28:53.094Z"
+    },
+    {
+      "url": "https://petrovich.ru/catalog/285396254/",
+      "error": "HTTP 503",
+      "at": "2026-11-18T12:31:30.175Z"
+    },
+    {
+      "url": "https://petrovich.ru/catalog/285396198/",
+      "error": "HTTP 503",
+      "at": "2026-11-18T12:33:19.201Z"
+    },
+    {
+      "url": "https://petrovich.ru/catalog/285396446/",
+      "error": "HTTP 503",
+      "at": "2026-11-18T12:43:01.158Z"
+    },
+    {
+      "url": "https://petrovich.ru/catalog/285396382/",
+      "error": "HTTP 503",
+      "at": "2026-11-18T12:45:54.186Z"
+    },
+    {
+      "url": "https://petrovich.ru/catalog/285397248/",
+      "error": "Failed to fetch",
+      "at": "2026-11-18T12:55:32.825Z"
+    },
+    {
+      "url": "https://petrovich.ru/catalog/7186/",
+      "error": "signal is aborted without reason",
+      "at": "2026-11-18T13:07:09.830Z"
+    },
+    {
+      "url": "https://petrovich.ru/catalog/7187/",
+      "error": "signal is aborted without reason",
+      "at": "2026-11-18T13:07:33.825Z"
+    },
+    {
+      "url": "https://petrovich.ru/catalog/226932262/",
+      "error": "HTTP 503",
+      "at": "2026-11-18T13:11:22.632Z"
+    },
+    {
+      "url": "https://petrovich.ru/catalog/286000219/",
+      "error": "HTTP 503",
+      "at": "2026-11-18T13:16:33.388Z"
+    },
+    {
+      "url": "https://petrovich.ru/catalog/285397119/",
+      "error": "HTTP 503",
+      "at": "2026-11-18T13:26:07.547Z"
+    },
+    {
+      "url": "https://petrovich.ru/catalog/95761886/",
+      "error": "signal is aborted without reason",
+      "at": "2026-11-18T13:28:59.847Z"
+    },
+    {
+      "url": "https://petrovich.ru/catalog/285396570/",
+      "error": "signal is aborted without reason",
+      "at": "2026-11-18T13:30:15.842Z"
+    },
+    {
+      "url": "https://petrovich.ru/catalog/285397636/",
+      "error": "signal is aborted without reason",
+      "at": "2026-11-18T13:36:10.856Z"
+    },
+    {
+      "url": "https://petrovich.ru/catalog/285396797/",
+      "error": "HTTP 503",
+      "at": "2026-11-18T13:40:48.244Z"
+    },
+    {
+      "url": "https://petrovich.ru/catalog/285396527/",
+      "error": "HTTP 503",
+      "at": "2026-11-18T13:45:27.190Z"
+    },
+    {
+      "url": "https://petrovich.ru/catalog/285396016/",
+      "error": "Failed to fetch",
+      "at": "2026-11-18T13:46:06.276Z"
+    },
+    {
+      "url": "https://petrovich.ru/catalog/226932354/",
+      "error": "HTTP 503",
+      "at": "2026-11-18T13:53:26.052Z"
+    },
+    {
+      "url": "https://petrovich.ru/catalog/286000644/",
+      "error": "HTTP 403",
+      "at": "2026-11-18T13:55:57.619Z"
+    }
+  ],
+  "redirects": [
+    {
+      "url": "https://petrovich.ru/catalog/286000084/",
+      "target": "https://petrovich.ru/catalog/1459/",
+      "at": "2026-11-18T11:21:15.046Z"
+    },
+    {
+      "url": "https://petrovich.ru/catalog/286000104/",
+      "target": "https://petrovich.ru/catalog/7196/",
+      "at": "2026-11-18T11:30:34.332Z"
+    },
+    {
+      "url": "https://petrovich.ru/catalog/286000102/",
+      "target": "https://petrovich.ru/catalog/7201/",
+      "at": "2026-11-18T11:30:37.293Z"
+    },
+    {
+      "url": "https://petrovich.ru/catalog/286000098/",
+      "target": "https://petrovich.ru/catalog/12119/",
+      "at": "2026-11-18T11:30:40.028Z"
+    }
+  ],
+  "warnings": [
+    "Canonical category redirect https://petrovich.ru/catalog/286000084/ -> https://petrovich.ru/catalog/1459/; alias left unexpanded for independent review.",
+    "Canonical category redirect https://petrovich.ru/catalog/286000104/ -> https://petrovich.ru/catalog/7196/; alias left unexpanded for independent review.",
+    "Canonical category redirect https://petrovich.ru/catalog/286000102/ -> https://petrovich.ru/catalog/7201/; alias left unexpanded for independent review.",
+    "Canonical category redirect https://petrovich.ru/catalog/286000098/ -> https://petrovich.ru/catalog/12119/; alias left unexpanded for independent review."
+  ],
+  "stop_reason": "blocked",
+  "input_complete": false,
+  "note": "Completeness is heuristic; independently review every root and branch."
+}

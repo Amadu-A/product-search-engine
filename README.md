@@ -1,61 +1,146 @@
 <!-- README.md -->
-# Product Search Engine — этап 1
+# Product Search Engine
 
-Сервис принимает локальное дерево категорий из JSON или структурированного HTML,
-экспортирует плоский `categories.json`, проверяет структуру и показывает план.
-`import --input ...` выполняет preview; отдельный `--apply` записывает PostgreSQL.
-Неполные деревья разрешены. Циклы, дубли и потерянные родители по-прежнему запрещены.
-Permission/review для локального импорта не нужны; UNKNOWN/unverified сохраняются
-информационно. Отчёт сборщика и подозрительные названия отражаются предупреждениями.
-Товары, цены, Excel и frontend в этот этап не входят. Макет сохранён в `renders/`.
+Импорт каталогов товаров в PostgreSQL с нормализацией, распознаванием через shared
+VLM, поиском категорий в проектном Qdrant и ручной проверкой. Рабочее место:
+`/admin/import`, проверка: `/admin/review`, Swagger: `/docs`.
+Цены из файлов сохраняются как **исторические непроверенные наблюдения**.
+Ссылки магазинов не открываются, актуальные цены не вычисляются.
 
-Структура: `app/domain/` — правила дерева и план; `app/application/` — use-case и
-порты; `app/infrastructure/` — файлы, PostgreSQL и ограниченный Petrovich adapter;
-`app/bootstrap.py` — сборка зависимостей; `migrations/` — Alembic;
-`tests/fixtures/` — собственные синтетические данные; `ops/`, `scripts/` — команды.
-Все рабочие файлы, отчёты, кэши и логи находятся в `.tmp/`;
-локальные `data/` и `examples/` игнорируются Git.
+Категории в рабочей БД сохраняются с прежними UUID. Старый файл из 2775 узлов
+`data/initial/input.json` для этапа 02 **не загружать**: текущий источник истины — SQL.
+Предоставленный `data/fixtures/categories_fixture.dump` используется только тестами.
 
-В приватном `.env` нужен только `POSTGRES_PASSWORD=<случайный пароль>`.
-Не копируйте `.env.example`: Pydantic читает его перед `.env`, затем окружение процесса.
-Compose использует те же env-файлы и явные переменные; команды ниже передают оба слоя.
-Не выводите `docker compose config` с раскрытыми значениями — используйте `--quiet`.
+Структура: `app/domain/` — DTO и независимые правила; `app/application/` — общие
+операции CLI/HTTP; `app/infrastructure/` — PostgreSQL, форматы, shared/Rabbit/Qdrant;
+`app/presentation/` — FastAPI, шаблон и отдельные CSS/JS; `app/workers/` — обработка
+заданий; `migrations/` — Alembic; `tests/` — регрессии и Playwright;
+`docs/contracts/`, `docs/prompts/`, `docs/embedding/` — проверяемые контракты.
+Все рабочие файлы/логи/кэши/скриншоты находятся в `.tmp/`.
 
-Первый запуск на Linux (Docker Compose ≥ 2.24, Git, Python 3):
+В `.env` нужны `POSTGRES_PASSWORD` и для серверного live-режима
+`RABBITMQ_PASSWORD` отдельного пользователя проекта. Не копировать туда весь baseline
+и не перетирать существующий файл. Все поддерживаемые настройки описаны в
+`.env.example`; Pydantic читает `.env.example` → `.env` → окружение процесса.
+Compose использует те же defaults/overrides. Проверять интерполяцию через
+`docker compose --env-file .env.example --env-file .env config --quiet`.
+По решению владельца от 24.11.2026 авторизация UI/API сейчас отключена;
+audit actor `operator_unverified` не выдаётся за проверенную личность.
+
+На Ubuntu, после заполнения секретов (Docker Compose ≥2.24, Git, Python 3):
 
 ```bash
 cd ~/projects/product-search-engine
-python3 -c 'import os,secrets; p=".env"; os.path.exists(p) or os.fdopen(os.open(p,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),"w").write("POSTGRES_PASSWORD="+secrets.token_hex(32)+"\n")'
+export HTTP_BIND_IP=192.168.55.3 HTTP_HOST_PORT=8092
+export APP_UID="$(id -u)" APP_GID="$(id -g)"
 bash scripts/up.sh
 ```
 
-Повторный запуск — только `bash scripts/up.sh`: пароль, volume и категории сохраняются.
-Запускается проектная БД, применяются миграции, проверяется реальное SQL-подключение.
-Категории автоматически не загружаются. Host ports отсутствуют: для CLI не нужен
-внешний HTTP endpoint. Shared-сервисы, сети и соседние проекты не используются.
+Адрес и порт выше повторно проверены свободными на aistation 25.11.2026; перед первым
+deploy повторно сверить `ss -lnt`. По умолчанию UI привязан к loopback со случайным
+портом; `up.sh` выводит фактический адрес. На сервере с указанными override:
+`http://192.168.55.3:8092/admin/import` и `http://192.168.55.3:8092/docs`.
+Запуск сохраняет volumes/пароли/категории, делает backup перед миграцией 0003,
+проверяет project RabbitMQ user/vhost, миграции, индекс и HTTP readiness.
+Shared сервисы не перезапускаются; PostgreSQL и Qdrant не публикуются наружу.
+Каталоги автоматически не загружаются.
 
-Проверка Windows (нужен `uv` и Python 3.12):
+На Windows для локального MOCK (Docker Desktop и Git Bash, секрет PostgreSQL
+в собственном `.env`; отдельные VLM/embedding/RabbitMQ не нужны):
+
+```powershell
+$env:MSYS_NO_PATHCONV = '1'
+& 'C:\Program Files\Git\bin\bash.exe' scripts/up.sh --mock
+```
+
+Открыть опубликованный loopback-порт из вывода. На Ubuntu тот же изолированный
+режим запускается `bash scripts/up.sh --mock`. В UI виден явный баннер MOCK.
+Обычный серверный режим использует `shared-vlm`, `shared-embedding` в `ai-shared`
+и отдельные `product_search_engine_app` / `product-search-engine` в shared RabbitMQ.
+Отсутствующие project user/vhost создаются только вместе, существующие credentials
+не меняются. При конфликте ownership запуск останавливается с диагностикой.
+
+Поддерживаются четыре входных формата. Обязательное поле — `name`.
+Дополнительные: `source_key`, `brand`, `manufacturer`, `mpn`, `unit`, `quantity`,
+`price`, `currency`, `price_date`, `seller`, `seller_inn`, `product_url`, `category_path`.
+`price`/`quantity` — десятичные строки; отсутствующие валюту/единицу не угадываем.
+Seller не становится Brand/Manufacturer. Исходные байты и raw сохраняются отдельно.
+
+JSON `catalog_items_v1`:
+
+```json
+{"schema_version":1,"source":"supplier_example","items":[{"source_key":"row-1","name":"Кабель тестовый","unit":"м","quantity":"2","price":"12.50","currency":"RUB","price_date":"2024-11-18","category_path":["Электрика","Кабели"]}]}
+```
+
+Также принимается **исходный AITIM** без преобразования:
+
+```json
+{"source":"archive_example","total_unique_records":1,"records":[{"name":"Кабель тестовый","unit":null,"price":"12.50","date":"30.11.2024","organization":"Пример продавца","inn":null,"url":null,"matched_queries":["кабель"]}]}
+```
+
+Обычный массив JSON с произвольными ключами требует подтверждённого mapping.
+XML `catalog_items_v1` (DTD/XXE/XInclude запрещены):
+
+```xml
+<catalog schema_version="1" source="supplier_example"><item><name>Кабель тестовый</name><unit>м</unit><price>12.50</price><currency>RUB</currency><category_path><part>Электрика</part><part>Кабели</part></category_path></item></catalog>
+```
+
+CSV — UTF-8/BOM; CP1251 выбирается явно. Разделители `;`, `,`, tab и quoting:
+
+```csv
+source_key;name;unit;quantity;price;currency;price_date;category_path
+row-1;Кабель тестовый;м;2;12.50;RUB;2024-11-18;Электрика > Кабели
+```
+
+XLSX — выбранные листы, строка заголовков по умолчанию №1, те же колонки, что CSV.
+Дата — ISO-строка или Excel date; `category_path` разделён ` > `. Формулы не
+исполняются; отсутствие cached value отмечается. XLS/XLSM/SVC не поддерживаются.
+Для CSV/XLSX/обычного JSON источник можно задать в UI; default — имя файла.
+Готовые синтетические шаблоны всех четырёх форматов скачиваются в UI.
+[Полная спецификация форматов](docs/import-formats.md).
+
+Проверки Windows (uv и Python 3.12; полная интеграция требует Docker Desktop):
 
 ```powershell
 ./ops/check-quality.ps1
-# Полный прогон с настоящей временной PostgreSQL в Docker:
 ./ops/check-quality.ps1 -Integration
 ```
 
-Если Windows блокирует запуск скрипта политикой текущего процесса:
-`powershell -NoProfile -ExecutionPolicy Bypass -File ./ops/check-quality.ps1 -Integration`.
-Скрипт сохранён с UTF-8 BOM для Windows PowerShell 5.1.
-На Linux: `bash scripts/test.sh` — Ruff, форматирование и все тесты в отдельном
-временном Docker stack. Проверки выводят логи в терминал и возвращают ненулевой код
-при ошибке; JSON/coverage/JUnit артефакты остаются в `.tmp/`.
+Ubuntu:
 
-[Порядок preview, импорта и отчёта](docs/import.md).
-[Актуальное ТЗ](docs/technical-assignment.md).
-[Матрица проверок](docs/test-matrix.md).
-[Полный перечень файлов и контрактов этапа](docs/files-changed.md).
-[Результаты проверки частичного дерева](docs/reports/petrovich_taxonomy_import.md).
+```bash
+bash scripts/test.sh        # настоящие временные PostgreSQL/Qdrant, MOCK inference
+bash scripts/test.sh --live # на aistation: реальные shared-модели, тестовые БД/индекс
+```
 
-2775 уже собранных узлов из `data/input.json` можно загрузить без повторного обхода.
-`complete=false`, 192 необработанные страницы, 20 ошибок и 4 redirect сохраняются.
-Исходные файлы не редактируются; нормализация и признаки качества имеют отдельный отчёт.
-HTTP-адаптер сохраняет прежние ограничения и для локального импорта не используется.
+Для полного AITIM E2E должны присутствовать локальные
+`examples/aitim_200_raw.json` и `data/fixtures/categories_fixture.dump`.
+`examples/` остаётся в `.gitignore`, передаётся на сервер отдельно. Без этих файлов
+соответствующий offline тест помечается skipped; live-приёмка требует их наличия.
+Остальные browser-тесты используют собственные данные. Assisted-разметка не является Gold.
+
+CLI использует тот же импортёр. Windows gate выше подготавливает `.tmp/venv`:
+
+```powershell
+& .tmp/venv/Scripts/python.exe -m app import-file --input examples/aitim_200_raw.json --dry-run
+```
+
+Серверные импорт и отчёт — две явные операции; вторая выполняется после окончания
+задания, UUID берётся из первой команды:
+
+```bash
+mkdir -p .tmp/uploads/bootstrap
+cp examples/aitim_200_raw.json .tmp/uploads/bootstrap/
+docker compose --env-file .env.example --env-file .env run --rm --no-deps app import-file --input .tmp/uploads/bootstrap/aitim_200_raw.json --profile auto --apply
+docker compose --env-file .env.example --env-file .env run --rm --no-deps app import-report --job-id UUID --summary | tee .tmp/reports/catalog-pilot.json
+```
+
+Без `--apply` CLI не пишет jobs/raw/товары. HTTP upload сохраняет preview job,
+а `start` ставит его в durable очередь. Ручные решения имеют приоритет при повторе;
+VLM предлагает категории, утверждение человеком отдельно. Файл mapping:
+`{"fields":{"name":"Описание","price":"Стоимость"},"confirmed":true}`.
+Для продолжения CLI: `import-file --job-id UUID --apply`.
+
+[Операции, транзакции и восстановление](docs/import.md) ·
+[ТЗ](docs/technical-assignment.md) · [Матрица тестов](docs/test-matrix.md) ·
+[Файлы и контракты](docs/files-changed.md) · [Результаты этапа 02](docs/reports/stage-02.md).

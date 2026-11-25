@@ -11,6 +11,7 @@ from pydantic import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.bootstrap import build_import, build_report
+from app.domain.catalog import CatalogError, DependencyUnavailable
 from app.domain.taxonomy import (
     Permission,
     Review,
@@ -50,6 +51,47 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("report")
     commands.add_parser("db-check")
     commands.add_parser("fetch-petrovich", help="Один разрешённый каталог, без массового обхода")
+    commands.add_parser("serve", help="HTTP UI и Swagger")
+    worker = commands.add_parser("worker", help="Durable ingestion и index worker")
+    worker.add_argument("--once", action="store_true")
+    file_import = commands.add_parser("import-file", help="Общий с UI импорт номенклатуры")
+    file_import.add_argument("--input", type=Path)
+    file_import.add_argument("--profile", default="auto")
+    file_import.add_argument("--mapping-file", type=Path)
+    file_import.add_argument("--job-id")
+    mode = file_import.add_mutually_exclusive_group()
+    mode.add_argument("--apply", action="store_true")
+    mode.add_argument("--dry-run", action="store_true")
+    for name in (
+        "taxonomy-index-status",
+        "taxonomy-reindex",
+        "taxonomy-singletons",
+        "live-smoke",
+        "infrastructure-check",
+    ):
+        extra = commands.add_parser(name)
+        if name == "taxonomy-reindex":
+            modes = extra.add_mutually_exclusive_group()
+            modes.add_argument("--apply", action="store_true")
+            modes.add_argument("--dry-run", action="store_true")
+            extra.add_argument("--force", action="store_true")
+    report = commands.add_parser("import-report")
+    report.add_argument("--job-id", required=True)
+    report.add_argument("--summary", action="store_true")
+    decision = commands.add_parser("review-item")
+    decision.add_argument("--item-id", required=True)
+    decision.add_argument("--decision-file", type=Path, required=True)
+    decision.add_argument("--idempotency-key", required=True)
+    category = commands.add_parser("create-category")
+    category.add_argument("--input", type=Path, required=True)
+    category.add_argument("--idempotency-key", required=True)
+    change = commands.add_parser("taxonomy-change")
+    change.add_argument("--input", type=Path, required=True)
+    change.add_argument("--idempotency-key", required=True)
+    apply_change = commands.add_parser("taxonomy-change-apply")
+    apply_change.add_argument("--change-id", required=True)
+    apply_change.add_argument("--expected-sha256", required=True)
+    apply_change.add_argument("--idempotency-key", required=True)
     return root
 
 
@@ -89,6 +131,24 @@ def review_template(snapshot: Snapshot, settings: Settings) -> dict:
 
 def dispatch(args: argparse.Namespace, settings: Settings) -> dict:
     """Преобразует CLI-аргументы в вызов одного application use-case."""
+    if args.command in {
+        "serve",
+        "worker",
+        "import-file",
+        "import-report",
+        "review-item",
+        "create-category",
+        "taxonomy-index-status",
+        "infrastructure-check",
+        "taxonomy-change",
+        "taxonomy-change-apply",
+        "taxonomy-reindex",
+        "taxonomy-singletons",
+        "live-smoke",
+    }:
+        from app.catalog_cli import dispatch_catalog
+
+        return dispatch_catalog(args, settings)
     if args.command in {"export", "import"}:
         snapshot = normalize_file(
             args.input,
@@ -173,8 +233,15 @@ def main(argv: list[str] | None = None) -> int:
             level=settings.log_level, format="%(asctime)s %(levelname)s %(message)s"
         )
         result = dispatch(args, settings)
-    except (TaxonomyError, OSError, ValueError, SQLAlchemyError) as error:
-        if isinstance(error, TaxonomyError):
+    except (
+        TaxonomyError,
+        CatalogError,
+        DependencyUnavailable,
+        OSError,
+        ValueError,
+        SQLAlchemyError,
+    ) as error:
+        if isinstance(error, (TaxonomyError, CatalogError, DependencyUnavailable)):
             message = str(error)
         elif isinstance(error, ValidationError):
             message = "Неверный контракт/настройки; поля: " + ", ".join(

@@ -1,0 +1,20 @@
+# compose.dev.yaml
+# Изолированный MOCK без подключения к ai-shared и без отдельного брокера.
+services:
+  api:
+    environment:
+      INFERENCE_MODE: mock
+      JOB_TRANSPORT: postgres
+  worker:
+    environment:
+      INFERENCE_MODE: mock
+      JOB_TRANSPORT: postgres
+  app:
+    environment:
+      INFERENCE_MODE: mock
+      JOB_TRANSPORT: postgres
+networks:
+  shared:
+    external: false
+    name: ${COMPOSE_PROJECT_NAME:-product-search-engine}-demo-inference
+    internal: true
