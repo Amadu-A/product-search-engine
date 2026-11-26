@@ -44,6 +44,44 @@ def candidate_view(row: dict) -> dict:
     )
 
 
+def suggested_category_ids(decision: dict) -> list[str]:
+    """Извлекает только UUID, которые VLM выбрала или сравнила, и учитывает прямые отказы."""
+    evidence = decision["evidence"]
+    hybrid = evidence.get("hybrid", evidence)
+    ranked: list[str] = []
+    rejected = set(evidence.get("semantic_check_declined_ids", []))
+    if decision["status"] == "proposed" and decision["category_id"]:
+        ranked.append(str(decision["category_id"]))
+    for reply, candidates in (
+        (hybrid.get("answer_2", {}), hybrid.get("candidates", decision["candidates"])),
+        (evidence.get("semantic_check", {}), evidence.get("semantic_check_candidates", [])),
+    ):
+        allowed = {c["category_id"] for c in candidates}
+        if reply.get("status") == "selected" and reply["category_id"] in allowed:
+            ranked.append(reply["category_id"])
+        elif reply.get("status") == "needs_review":
+            ranked.extend(key for key in reply.get("compared_candidate_ids", []) if key in allowed)
+        elif reply.get("status") == "no_suitable_category":
+            rejected.update(allowed)
+    steps = evidence.get("hierarchical_steps", [])
+    if steps:
+        step = steps[-1]
+        reply = step["answer_3"]
+        selected = reply.get("category_id")
+        if reply["action"] == "select_child" and selected in step["allowed_ids"]:
+            ranked.insert(0, selected)
+        if reply["action"] == "select_current" and any(
+            selected in arrival["allowed_ids"] and selected == arrival["answer_3"]["category_id"]
+            for arrival in steps[:-1]
+        ):
+            ranked.insert(0, selected)
+    if evidence.get("semantic_check", {}).get("status") == "no_suitable_category":
+        conflict = evidence.get("purpose_conflict", {}).get("rejected_category")
+        if conflict:
+            rejected.add(conflict["category_id"])
+    return [key for key in dict.fromkeys(ranked) if key not in rejected]
+
+
 @dataclass
 class CategorySelection:
     """Итог выбора и журнал, который сохраняется вместе с SQL-решением."""
@@ -191,14 +229,14 @@ class CategoryClassifier:
     def select(self, fields, answer, emit: Event, strategy="combined") -> CategorySelection:
         """Проверяет гибридный результат до перехода к обходу или уточнению родителя."""
         if strategy == "hierarchical":
-            return self.verify_hierarchy(self.run_hierarchy(fields, answer, emit), fields, answer)
+            return self.run_hierarchy(fields, answer, emit)
         hybrid = self.hybrid(answer, emit)
         self.check_exclusions(hybrid, fields)
         if strategy == "hybrid":
             return hybrid
         if hybrid.category is not None:
             return self.refine_broader(hybrid, fields, answer, emit)
-        fallback = self.verify_hierarchy(self.run_hierarchy(fields, answer, emit), fields, answer)
+        fallback = self.run_hierarchy(fields, answer, emit)
         fallback.evidence = {
             "hybrid": {"reason": hybrid.reason, "candidates": hybrid.candidates, **hybrid.evidence},
             **fallback.evidence,
@@ -243,39 +281,70 @@ class CategoryClassifier:
         )
         refinement = self.hierarchy.select(rows, fields, answer, emit, anchor)
         if refinement.category and refinement.category["category_id"] != anchor["category_id"]:
-            self.verify_hierarchy(refinement, fields, answer)
-            if refinement.category:
+            self.verify_hierarchy(refinement, fields, answer, rows)
+            if refinement.category and refinement.category["category_id"] != anchor["category_id"]:
                 refinement.evidence["hybrid"] = {"candidates": hybrid.candidates, **hybrid.evidence}
                 return refinement
         hybrid.evidence["broader_refinement"] = {"reason": refinement.reason, **refinement.evidence}
         return hybrid
 
-    def verify_hierarchy(self, result, fields, answer) -> CategorySelection:
-        """Проверяет смысл выбранного пути через существующий answer_2 по исходному изделию."""
+    def verify_hierarchy(self, result, fields, answer, rows=()) -> CategorySelection:
+        """Проверяет выбор обхода и отдельно рассматривает пригодного родителя при отказе."""
         self.check_exclusions(result, fields)
         if result.category is None:
             return result
-        if not self.has_scope_evidence(fields["name"], answer, result.category):
+        category = result.category
+        parents = category.get("path_ids", [])[1:-1]
+        by_id = {str(row["id"]): row for row in rows if str(row["id"]) in parents}
+        options = [category] + [
+            candidate_view(by_id[key]) for key in reversed(parents) if key in by_id
+        ]
+        options = [
+            option
+            for option in options
+            if option.get("is_assignable", True)
+            and not approved_category_exclusion(fields["name"], option)
+            and self.has_scope_evidence(fields["name"], answer, option)
+        ]
+        if not options:
             self.reject_selection(result, "Исходные сведения не подтверждают назначение ветки")
             return result
-        try:
-            check = self.inference.answer(
-                2,
-                {
-                    "answer_1_json": {**answer, "source_product_name": fields["name"]},
-                    "category_candidates_json": [result.category],
-                },
+        batches = [[category], options[1:]] if options[0] is category else [options]
+        for batch in filter(None, batches):
+            result.evidence["semantic_check_candidates"] = batch
+            try:
+                check = self.inference.answer(
+                    2,
+                    {
+                        "answer_1_json": {**answer, "source_product_name": fields["name"]},
+                        "category_candidates_json": batch,
+                    },
+                )
+            except (InvalidModelOutput, DependencyUnavailable) as error:
+                self.reject_selection(result, str(error))
+                result.technical_failure = True
+                result.evidence.setdefault("semantic_check_issues", []).extend(
+                    getattr(error, "attempts", [])
+                )
+                return result
+            reply = check["answer_json"]
+            result.evidence["semantic_check"] = reply
+            result.evidence.setdefault("semantic_check_issues", []).extend(
+                check.get("attempts", [])
             )
-        except (InvalidModelOutput, DependencyUnavailable) as error:
-            self.reject_selection(result, str(error))
-            result.technical_failure = True
-            result.evidence["semantic_check_issues"] = getattr(error, "attempts", [])
-            return result
-        reply = check["answer_json"]
-        result.evidence["semantic_check"] = reply
-        result.evidence["semantic_check_issues"] = check.get("attempts", [])
-        if reply["status"] != "selected" or reply["category_id"] != result.category["category_id"]:
-            self.reject_selection(result, reply["reason"])
+            result.reason = reply["reason"]
+            selected = next((c for c in batch if c["category_id"] == reply["category_id"]), None)
+            if reply["status"] == "selected" and selected is not None:
+                result.category = selected
+                if selected is not category:
+                    result.selection_type = "broader"
+                result.candidates = [selected]
+                return result
+            if reply["status"] == "no_suitable_category":
+                result.evidence.setdefault("semantic_check_declined_ids", []).extend(
+                    c["category_id"] for c in batch
+                )
+        self.reject_selection(result, result.reason)
         return result
 
     def has_scope_evidence(self, name: str, answer: dict, category: dict) -> bool:
@@ -285,16 +354,22 @@ class CategoryClassifier:
         if category.get("description") or category.get("purpose"):
             return True
         branch = " ".join([*category["path_names"], *category.get("aliases", [])])
-        # Сравниваем начала слов, чтобы простое склонение не скрывало связь.
-        words = {word[:4] for word in re.findall(r"[^\W\d_]{4,}", name.casefold())}
-        branch_words = {word[:4] for word in re.findall(r"[^\W\d_]{4,}", branch.casefold())}
-        return bool(words & branch_words)
+        return bool(self.scope_tokens(name) & self.scope_tokens(branch))
+
+    @staticmethod
+    def scope_tokens(text: str) -> set[str]:
+        """Сопоставляет основы, в том числе формы с беглой гласной в суффиксе -ок/-ек."""
+        return {
+            re.sub(r"[ое]к$", "к", word)[:4]
+            for word in re.findall(r"[^\W\d_]{4,}", text.casefold())
+        }
 
     def run_hierarchy(self, fields, answer, emit: Event) -> CategorySelection:
         """Снимает согласованный SQL-снимок перед сетевыми вызовами."""
         emit("classification.fallback", "Поиск по дереву PostgreSQL", {})
         _, rows = self.store.index_snapshot()
-        return self.hierarchy.select(rows, fields, answer, emit)
+        result = self.hierarchy.select(rows, fields, answer, emit)
+        return self.verify_hierarchy(result, fields, answer, rows)
 
     def hybrid(self, answer, emit: Event) -> CategorySelection:
         """Требует решения VLM по свежему candidate-set, включая широкие категории."""

@@ -1,4 +1,10 @@
 /* app/presentation/static/css/workspace.css */
+.catalog-list,.review__suggestions{list-style:none;margin:0;padding:0}
+.catalog-list li{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;border-bottom:1px solid var(--line);padding:10px 0}
+.catalog-list li span{overflow-wrap:anywhere}
+.catalog-list small{display:block;margin-top:3px}
+.review__suggestions button{width:100%;margin-bottom:6px;text-align:left;justify-content:start;overflow-wrap:anywhere}
+.review__actions{margin:8px 0 12px}
 .mobile-tabs{display:none}
 @media(max-width:760px){.mobile-tabs{display:flex;grid-column:1/-1;gap:4px;overflow:auto;padding:2px}.mobile-tabs button{flex:1;white-space:nowrap;font-size:12px;padding:7px}.mobile-tabs button[aria-pressed=true]{background:#d9f2f1;border-bottom:3px solid var(--teal)}body:not([data-mobile-tab=file]) .upload,body[data-mobile-tab=file] .workspace__main,body:not([data-mobile-tab=processing]) .progress,body[data-mobile-tab=processing] .review{display:none}body[data-mobile-tab=review] .review__tree{display:none}body[data-mobile-tab=categories] .review>.section-heading,body[data-mobile-tab=categories] .review>.toolbar,body[data-mobile-tab=categories] #bulk-preview,body[data-mobile-tab=categories] .review__list,body[data-mobile-tab=categories] .review__details{display:none}}
 #files{position:absolute;width:1px;height:1px;padding:0;overflow:hidden;clip-path:inset(50%);white-space:nowrap;border:0}.upload__drop:focus-within{outline:3px solid #37b9cc;outline-offset:3px}.review table{min-width:430px}.review th:not(:first-child),.review td:not(:first-child){overflow-wrap:normal;min-width:75px}#mapping-fields{max-height:320px;overflow:auto}

@@ -49,7 +49,9 @@ class CatalogStore:
         products = unit.table("products")
         counts = dict(
             unit.connection.execute(
-                sa.select(products.c.category_id, sa.func.count()).group_by(products.c.category_id)
+                sa.select(products.c.category_id, sa.func.count())
+                .where(products.c.status != "retired")
+                .group_by(products.c.category_id)
             ).all()
         )
         by_id = {str(row["id"]): row for row in rows}
@@ -332,7 +334,7 @@ class CatalogSession:
         self.update("ingest_jobs", job_id, **counts)
         return counts
 
-    def reclassification_items(self, job_id) -> list[dict]:
+    def reclassification_items(self, job_id, only_remaining: bool = False) -> list[dict]:
         """Выбирает незакрытые решения и старые назначения без Product."""
         items, decisions = (self.table(n) for n in ("ingest_job_items", "classification_decisions"))
         related = decisions.c.normalized_record_id == items.c.normalized_record_id
@@ -340,15 +342,45 @@ class CatalogSession:
             related, decisions.c.method == "manual", decisions.c.status == "approved"
         )
         proposed = sa.exists().where(related, decisions.c.status == "proposed")
+        if only_remaining:
+            eligible = ~manual & (items.c.status == "needs_review")
+        else:
+            eligible = sa.or_(
+                (items.c.status == "assigned") & items.c.product_id.is_(None),
+                ~manual
+                & (items.c.status != "not_product")
+                & sa.or_(items.c.status.in_(["needs_review", "taxonomy_gap"]), proposed),
+            )
+        products = self.table("products")
+        retired = sa.exists().where(
+            products.c.id == items.c.product_id, products.c.status == "retired"
+        )
         query = sa.select(items).where(
             items.c.job_id == UUID(str(job_id)),
             items.c.normalized_record_id.is_not(None),
-            sa.or_(
-                (items.c.status == "assigned") & items.c.product_id.is_(None),
-                ~manual & sa.or_(items.c.status.in_(["needs_review", "taxonomy_gap"]), proposed),
-            ),
+            ~retired,
+            eligible,
         )
         return [dict(row) for row in self.connection.execute(query).mappings()]
+
+    def queue_reclassification(self, item: dict) -> bool:
+        """Ставит в очередь лишь неизменившуюся позицию и инвалидирует старый UI preview."""
+        table = self.table("ingest_job_items")
+        result = self.connection.execute(
+            table.update()
+            .where(
+                table.c.id == item["id"],
+                table.c.processing_version == item["processing_version"],
+                table.c.status == item["status"],
+            )
+            .values(
+                status="pending",
+                issue_codes=sorted(set(item["issue_codes"]) | {"reclassify_requested"}),
+                processing_version=item["processing_version"] + 1,
+                updated_at=datetime.now(UTC),
+            )
+        )
+        return result.rowcount == 1
 
     def manual_category_exists(self, items):
         """Определяет ручное назначение по действующему решению и той же категории."""
@@ -365,6 +397,7 @@ class CatalogSession:
         items, products = (self.table(n) for n in ("ingest_job_items", "products"))
         manual = self.manual_category_exists(items)
         assigned = items.c.status == "assigned"
+        archived = items.c.issue_codes.contains(["archived_not_product"])
         query = (
             sa.select(
                 sa.func.count().filter(assigned & ~manual).label("auto_assigned_count"),
@@ -373,9 +406,12 @@ class CatalogSession:
                 .filter(assigned & items.c.product_id.is_(None))
                 .label("assigned_without_product_count"),
                 sa.func.count(sa.distinct(products.c.id))
-                .filter(products.c.category_id.is_not(None))
+                .filter(products.c.category_id.is_not(None) & (products.c.status != "retired"))
                 .label("categorized_products_count"),
-                sa.func.count().filter(items.c.status == "not_product").label("not_product_count"),
+                sa.func.count()
+                .filter((items.c.status == "not_product") & ~archived)
+                .label("not_product_count"),
+                sa.func.count().filter(archived).label("archived_not_product_count"),
                 sa.func.count()
                 .filter(
                     sa.or_(
@@ -419,6 +455,7 @@ class CatalogSession:
             "matches": [],
             "decisions": [],
             "observations": [],
+            "product": self.get("products", item["product_id"]) if item["product_id"] else None,
         }
         if item["raw_record_id"]:
             result["raw"] = self.get("raw_records", item["raw_record_id"])
@@ -433,12 +470,16 @@ class CatalogSession:
             result["decisions"] = self.all("classification_decisions", normalized_record_id=key)
         return result
 
-    def items_page(self, job_id, status, query: str, offset: int, limit: int) -> dict:
+    def items_page(
+        self, job_id, status, query: str, offset: int, limit: int, include_archived: bool = False
+    ) -> dict:
         """SQL join/pagination таблицы items без обхода каждого raw отдельным запросом."""
         items, norm, categories = (
             self.table(n) for n in ("ingest_job_items", "normalized_records", "categories")
         )
         condition = [items.c.job_id == UUID(str(job_id))]
+        if not include_archived:
+            condition.append(~items.c.issue_codes.contains(["archived_not_product"]))
         if status:
             condition.append(
                 items.c.status.in_(["needs_review", "taxonomy_gap", "invalid_record", "error"])
@@ -490,7 +531,9 @@ class CatalogSession:
     def products_page(self, query: str, offset: int, limit: int) -> dict:
         """Отдаёт read-only страницу Product, не подмешивая непроверенную текущую цену."""
         table = self.table("products")
-        condition = table.c.canonical_name.icontains(query, autoescape=True)
+        condition = (table.c.status != "retired") & table.c.canonical_name.icontains(
+            query, autoescape=True
+        )
         count = self.connection.scalar(
             sa.select(sa.func.count()).select_from(table).where(condition)
         )
@@ -635,8 +678,18 @@ class CatalogSession:
 
     def assign_record_items(self, record_id, category_id, product_id) -> set:
         """Обновляет все представления одной записи и инвалидирует старые expected_version."""
+        items, products = (self.table(n) for n in ("ingest_job_items", "products"))
+        query = (
+            sa.select(items)
+            .outerjoin(products, products.c.id == items.c.product_id)
+            .where(
+                items.c.normalized_record_id == record_id,
+                ~items.c.issue_codes.contains(["archived_not_product"]),
+                products.c.status.is_distinct_from("retired"),
+            )
+        )
         jobs = set()
-        for item in self.all("ingest_job_items", normalized_record_id=record_id):
+        for item in self.connection.execute(query).mappings():
             self.update(
                 "ingest_job_items",
                 item["id"],
@@ -706,6 +759,45 @@ class CatalogSession:
                 sa.select(sa.func.count()).select_from(table).where(table.c[column] == category_id)
             )
         return references
+
+    def active_category_products(self, category_id) -> int:
+        """Считает только доступные товары, которые потребуют переназначения."""
+        products = self.table("products")
+        return self.connection.scalar(
+            sa.select(sa.func.count())
+            .select_from(products)
+            .where(products.c.category_id == category_id, products.c.status != "retired")
+        )
+
+    def retire_product(self, product_id) -> dict:
+        """Скрывает товар и его предложения, сохраняя UUID и историю загрузок."""
+        offers, items = (self.table(name) for name in ("offers", "ingest_job_items"))
+        self.update("products", product_id, status="retired")
+        retired_offers = self.connection.execute(
+            offers.update()
+            .where(offers.c.product_id == product_id, offers.c.status != "retired")
+            .values(status="retired", updated_at=datetime.now(UTC))
+        ).rowcount
+        linked_items = self.connection.scalar(
+            sa.select(sa.func.count()).select_from(items).where(items.c.product_id == product_id)
+        )
+        return {"offers_archived": retired_offers, "linked_items": linked_items}
+
+    def unarchived_not_products(self, job_id, lock: bool = False) -> list[dict]:
+        """Выбирает позиции «Не товар» текущего задания, не затрагивая его историю."""
+        items = self.table("ingest_job_items")
+        query = (
+            sa.select(items)
+            .where(
+                items.c.job_id == UUID(str(job_id)),
+                items.c.status == "not_product",
+                ~items.c.issue_codes.contains(["archived_not_product"]),
+            )
+            .order_by(items.c.id)
+        )
+        if lock:
+            query = query.with_for_update()
+        return [dict(row) for row in self.connection.execute(query).mappings()]
 
     def lock_taxonomy_change(self) -> None:
         """Сериализует утверждённый changeset с произвольным SQL изменением дерева."""

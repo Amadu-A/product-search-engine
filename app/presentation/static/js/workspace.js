@@ -8,6 +8,7 @@ const state = {job: null, preview: null, selected: null, category: null, categor
 state.bulk = new Map();
 state.bulkPreview = null;
 const terminal = new Set(['completed', 'completed_with_issues', 'failed', 'canceled']);
+const completed = new Set(['completed', 'completed_with_issues']);
 const labels = {pending:'Ожидает', understanding:'Распознавание', matching:'Сопоставление', classifying:'Классификация', assigned:'Назначено', needs_review:'На проверке', taxonomy_gap:'Нет категории', not_product:'Не товар', invalid_record:'Некорректная строка', error:'Ошибка', queued:'В очереди', running:'Обработка', preview_ready:'Готов preview', completed:'Завершено', completed_with_issues:'Завершено с замечаниями', canceled:'Остановлено', cancel_requested:'Остановка'};
 
 function notice(message, error = false) {
@@ -30,6 +31,7 @@ function showView(name) {
   $('#import-view').hidden = !['import', 'review'].includes(name);
   $('#history-view').hidden = name !== 'history';
   $('#categories-view').hidden = name !== 'categories';
+  $('#products-view').hidden = name !== 'products';
   document.querySelectorAll('[data-view]').forEach(button => {
     if (button.dataset.view === name) button.setAttribute('aria-current', 'page');
     else button.removeAttribute('aria-current');
@@ -38,37 +40,47 @@ function showView(name) {
   if (name === 'import') mobileTab('file');
   if (name === 'review') { mobileTab('review'); $('#item-status').value = 'needs_review'; refreshItems().catch(fail); }
   if (name === 'categories') renderAllCategories();
+  if (name === 'products') renderProducts().catch(fail);
 }
 document.querySelectorAll('[data-view]').forEach(button => button.addEventListener('click', () => showView(button.dataset.view)));
 
 async function categories() {
   state.categories = await api('/categories/tree');
+  if (state.category && !state.categories.some(c => c.id === state.category && isAssignable(c))) {
+    state.category = null;
+    $('#selected-category').textContent = 'Категория не выбрана';
+    $('#assign-button').disabled = true;
+  }
   renderTree();
   const select = $('#category-parent');
   select.replaceChildren(new Option('Корневая категория', ''));
   state.categories.filter(c => c.is_active && c.review_status !== 'deprecated').sort((a,b) => a.path_names.join(' / ').localeCompare(b.path_names.join(' / '), 'ru')).forEach(category => select.add(new Option(category.path_names.join(' → '), category.id)));
 }
+function isAssignable(category) {
+  return category.is_active && category.is_assignable && category.ancestors_active && category.review_status !== 'deprecated';
+}
 function renderTree() {
   const query = $('#category-search').value.toLocaleLowerCase('ru');
   const tree = $('#category-tree');
+  const visible = state.categories.filter(c => c.is_active && c.ancestors_active && c.review_status !== 'deprecated');
   tree.replaceChildren();
   const choose = category => {
     const button = element('button', category.name);
     button.type = 'button'; button.dataset.categoryId = category.id;
-    button.disabled = !category.is_active || !category.is_assignable || !category.ancestors_active || category.review_status === 'deprecated';
+    button.disabled = !isAssignable(category);
     button.setAttribute('aria-pressed', String(state.category === category.id));
     button.append(element('span', `${category.path_names.join(' → ')} · ${category.review_status} · товаров ${category.product_count || 0}`, 'tree__path'));
-    button.addEventListener('click', event => { event.preventDefault(); event.stopPropagation(); state.category = category.id; $('#selected-category').textContent = category.path_names.join(' → '); $('#assign-button').disabled = !state.selected; document.querySelectorAll('[data-category-id]').forEach(node => node.setAttribute('aria-pressed', String(node.dataset.categoryId === category.id))); });
+    button.addEventListener('click', event => { event.preventDefault(); event.stopPropagation(); state.category = category.id; $('#selected-category').textContent = category.path_names.join(' → '); updateReviewActions(); document.querySelectorAll('[data-category-id]').forEach(node => node.setAttribute('aria-pressed', String(node.dataset.categoryId === category.id))); });
     return button;
   };
   if (query) {
-    const rows = state.categories.filter(c => [...c.path_names,...c.aliases].join(' / ').toLocaleLowerCase('ru').includes(query));
+    const rows = visible.filter(c => [...c.path_names,...c.aliases].join(' / ').toLocaleLowerCase('ru').includes(query));
     rows.slice(0,150).forEach(category => tree.append(choose(category)));
     if (rows.length > 150) tree.append(element('p', `Ещё ${rows.length - 150}. Уточните поиск.`, 'muted'));
     return;
   }
   const children = new Map();
-  state.categories.forEach(category => { const key = category.parent_id || ''; if (!children.has(key)) children.set(key, []); children.get(key).push(category); });
+  visible.forEach(category => { const key = category.parent_id || ''; if (!children.has(key)) children.set(key, []); children.get(key).push(category); });
   const branch = (category, depth) => {
     const nested = children.get(category.id) || [];
     if (!nested.length) return choose(category);
@@ -80,11 +92,48 @@ function renderTree() {
   (children.get('') || []).forEach(category => tree.append(branch(category,0)));
 }
 function renderAllCategories() {
-  $('#all-categories').replaceChildren();
-  state.categories.sort((a,b) => a.path_names.join(' / ').localeCompare(b.path_names.join(' / '), 'ru')).forEach(category => {
-    const row = element('div', category.path_names.join(' → '), 'category-row');
-    row.append(element('small', ` · ${category.review_status} · ${category.id}`));
-    $('#all-categories').append(row);
+  const query = $('#manage-category-search').value.trim().toLocaleLowerCase('ru');
+  const rows = state.categories
+    .filter(c => c.is_active && c.path_names.join(' → ').toLocaleLowerCase('ru').includes(query))
+    .sort((a,b) => a.path_names.join(' / ').localeCompare(b.path_names.join(' / '), 'ru'));
+  $('#category-list-count').textContent = rows.length > 100
+    ? `Показано 100 из ${rows.length}. Уточните поиск.` : `Найдено категорий: ${rows.length}`;
+  $('#all-categories').replaceChildren(...rows.slice(0,100).map(category => {
+    const row = element('li');
+    const remove = element('button', 'Удалить категорию');
+    remove.type = 'button';
+    remove.addEventListener('click', () => openCategoryArchive(category));
+    row.append(element('span', category.path_names.join(' → ')), remove);
+    return row;
+  }));
+}
+let productsOffset = 0;
+async function renderProducts() {
+  const params = new URLSearchParams({q:$('#product-search').value,offset:productsOffset,limit:50});
+  const result = await api(`/products?${params}`);
+  $('#product-count').textContent = `Найдено товаров: ${result.total}`;
+  $('#products').replaceChildren(...result.items.map(product => {
+    const row = element('li');
+    const category = state.categories.find(c => c.id === product.category_id);
+    const description = element('span', product.canonical_name);
+    description.append(element('small', category?.path_names.join(' → ') || 'Без категории', 'muted'));
+    const remove = element('button', 'Удалить товар');
+    remove.type = 'button';
+    remove.addEventListener('click', () => confirmProductArchive(product));
+    row.append(description, remove);
+    return row;
+  }));
+  $('#products-previous').disabled = !productsOffset;
+  $('#products-next').disabled = productsOffset + 50 >= result.total;
+}
+
+function confirmProductArchive(product) {
+  confirmArchive(`Удалить «${product.canonical_name}» и скрыть его предложения? Исходные записи и ручные решения останутся в истории.`, async () => {
+    const result = await api(`/products/${product.id}/archive`, {method:'POST',body:JSON.stringify({confirm:true})});
+    productsOffset = 0;
+    await Promise.all([renderProducts(), refresh()]);
+    if (state.selected?.product?.id === product.id) await selectItem(state.selected.item.id);
+    notice(`Товар удалён из каталога. Скрыто предложений: ${result.offers_archived}.`);
   });
 }
 
@@ -118,6 +167,7 @@ function renderPreview(result) {
 }
 async function selectJob(jobId) {
   state.job = jobId; state.offset = 0; state.selected = null;
+  renderItemDetail();
   state.bulk.clear(); updateBulk();
   localStorage.setItem('pse-import-job', jobId);
   const url = new URL(location); url.searchParams.set('job', jobId); window.history.replaceState({}, '', url);
@@ -143,6 +193,10 @@ async function refresh() {
   $('#auto-assigned-count').textContent = job.auto_assigned_count;
   $('#manual-assigned-count').textContent = job.manual_assigned_count;
   $('#not-product-count').textContent = job.not_product_count;
+  state.notProductCount = job.not_product_count;
+  $('#archive-not-products').hidden = !completed.has(job.status) || !job.not_product_count;
+  $('#archive-not-products').textContent = `Удалить позиции «Не товар» (${job.not_product_count})`;
+  $('#reclassify-button').disabled = !completed.has(job.status) || !job.needs_review_count;
   $('#review-count').textContent = job.needs_review_count;
   $('#gap-count').textContent = job.taxonomy_gap_count;
   $('#error-count').textContent = job.technical_error_count;
@@ -177,11 +231,52 @@ async function refreshItems() {
   $('#previous').disabled = !state.offset; $('#next').disabled = state.offset + 50 >= result.total;
 }
 async function selectItem(itemId) {
-  const detail = await api(`/import-jobs/${state.job}/items/${itemId}`);
+  const jobId = state.job;
+  const token = state.detailToken = (state.detailToken || 0) + 1;
+  const detail = await api(`/import-jobs/${jobId}/items/${itemId}`);
+  if (jobId !== state.job || token !== state.detailToken) return;
   state.selected = detail;
-  $('#detail-title').textContent = detail.normalized?.normalized_name || 'Без наименования';
-  const answer = detail.understandings.at(-1)?.answer_json;
-  $('#detail-summary').textContent = answer ? `Тип: ${answer.product_type || 'не установлен'}. ${answer.reason}` : 'Распознавание ещё не выполнено';
+  $('#decision-reason').value = '';
+  renderItemDetail();
+  await refreshItems();
+}
+function updateReviewActions() {
+  const detail = state.selected;
+  const canEdit = Boolean(detail && !detail.item.issue_codes.includes('archived_not_product') && detail.product?.status !== 'retired');
+  $('#assign-button').disabled = !canEdit || !state.category;
+  $('#mark-not-product').disabled = !canEdit || detail.item.status === 'not_product';
+  $('#leave-uncategorized').disabled = !canEdit;
+}
+function renderItemDetail() {
+  const detail = state.selected;
+  $('#detail-title').textContent = detail ? detail.normalized?.normalized_name || 'Без наименования' : 'Выберите позицию';
+  $('#detail-technical').hidden = !detail;
+  $('#detail-reason').hidden = true;
+  $('#suggestions').hidden = true;
+  $('#detail-summary').textContent = '';
+  updateReviewActions();
+  if (!detail) return;
+  const answer = [...detail.understandings]
+    .sort((a,b) => b.created_at.localeCompare(a.created_at))
+    .find(run => run.answer_json)?.answer_json ||
+    [...detail.decisions].sort((a,b) => b.created_at.localeCompare(a.created_at))
+      .find(decision => decision.evidence?.answer_1)?.evidence.answer_1;
+  $('#detail-summary').textContent = [answer?.product_type, answer?.purpose].filter(Boolean).join(' · ') ||
+    (detail.item.status === 'pending' ? 'Ожидает обработки' : 'Тип изделия пока не определён');
+  const reason = detail.product?.status === 'retired' ? 'Товар удалён из каталога.' :
+    detail.classification_reason || answer?.reason;
+  $('#detail-reason').textContent = reason || '';
+  $('#detail-reason').hidden = !reason;
+  const suggestions = detail.suggested_categories || [];
+  $('#suggestions').hidden = !suggestions.length;
+  $('#suggested-categories').replaceChildren(...suggestions.map(category => {
+    const row = element('li');
+    const button = element('button', `Утвердить: ${category.path_names.join(' → ')}`);
+    button.type = 'button';
+    button.addEventListener('click', () => decision('assign_category', category.category_id).catch(fail));
+    row.append(button);
+    return row;
+  }));
   $('#detail-raw').textContent = JSON.stringify(detail.raw?.payload, null, 2);
   const understanding = detail.understandings.map(({raw_response_text,...answer}) => answer);
   const decisions = detail.decisions.map(decision => ({...decision,evidence:{...decision.evidence,raw_response_text:undefined}}));
@@ -190,18 +285,17 @@ async function selectItem(itemId) {
     (key, value) => key === 'raw_response_text' ? undefined : value,
     2
   );
-  $('#detail-issues').replaceChildren(...(detail.normalized?.issues || []).map(issue => element('p', `${issue.code}: ${issue.message}`, 'issue')));
-  $('#assign-button').disabled = !state.category;
-  $('#confirm-product').disabled = !detail.item.product_id;
-  $('#reject-product').disabled = !detail.item.product_id;
-  $('#mark-not-product').disabled = false; $('#leave-uncategorized').disabled = false;
-  $('#confirm-proposal').disabled = !detail.decisions.some(d => d.status === 'proposed' && d.category_id);
-  await refreshItems();
 }
-async function decision(action) {
+async function decision(action, categoryId = state.category) {
   if (!state.selected) return;
   const item = state.selected.item;
-  await api(`/review/items/${item.id}/decisions`, {method:'POST',body:JSON.stringify({action,expected_version:item.processing_version,category_id:state.category,product_id:item.product_id,reason:$('#decision-reason').value})});
+  const reason = $('#decision-reason').value.trim();
+  if (action !== 'assign_category' && !reason) {
+    notice('Укажите комментарий к изменению статуса позиции.', true);
+    $('#decision-reason').focus();
+    return;
+  }
+  await api(`/review/items/${item.id}/decisions`, {method:'POST',body:JSON.stringify({action,expected_version:item.processing_version,category_id:categoryId,reason})});
   notice('Решение сохранено в PostgreSQL');
   await selectItem(item.id); await refresh();
 }
@@ -336,6 +430,20 @@ listen('#mapping-button','click',async () => {
 });
 listen('#cancel-button','click',async () => { await api(`/import-jobs/${state.job}/cancel`,{method:'POST'}); await refresh(); });
 listen('#resume-button','click',async () => { await api(`/import-jobs/${state.job}/resume`,{method:'POST'}); await selectJob(state.job); });
+listen('#reclassify-button','click',async event => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  const jobId = state.job;
+  try {
+    const result = await api(`/import-jobs/${jobId}/reclassify`, {method:'POST'});
+    if (jobId !== state.job) return;
+    if (result.queued) await selectJob(jobId);
+    notice(result.queued ? `Поставлено на повторную классификацию: ${result.eligible}` :
+      'Нет позиций для автоматической повторной классификации');
+  } finally {
+    await refresh();
+  }
+});
 listen('#category-search','input',renderTree);
 listen('#item-status','change',() => { state.offset = 0; return refreshItems(); });
 listen('#events','select-item',event => selectItem(event.detail));
@@ -343,15 +451,8 @@ listen('#item-search','change',() => { state.offset = 0; return refreshItems(); 
 listen('#previous','click',() => { state.offset = Math.max(0,state.offset - 50); return refreshItems(); });
 listen('#next','click',() => { state.offset += 50; return refreshItems(); });
 listen('#assign-button','click',() => decision('assign_category'));
-listen('#confirm-product','click',() => decision('confirm_product'));
-listen('#reject-product','click',() => decision('reject_product'));
 listen('#mark-not-product','click',() => decision('not_product'));
 listen('#leave-uncategorized','click',() => decision('leave_uncategorized'));
-listen('#confirm-proposal','click',() => {
-  const proposal = state.selected?.decisions.filter(d => d.status === 'proposed' && d.category_id).sort((a,b) => a.created_at.localeCompare(b.created_at)).at(-1);
-  if (!proposal) return;
-  state.category = proposal.category_id; renderTree(); return decision('assign_category');
-});
 function updateBulk() { $('#bulk-preview').disabled = !state.bulk.size; $('#bulk-preview').textContent = `Назначить выбранным (${state.bulk.size})`; }
 listen('#bulk-preview','click',async () => {
   const values = {items:[...state.bulk.values()],category_id:state.category,reason:$('#decision-reason').value};
@@ -373,7 +474,114 @@ listen('#category-form','submit',async event => {
   event.preventDefault();
   const result = await api('/categories',{method:'POST',body:JSON.stringify({name:$('#category-name').value,parent_id:$('#category-parent').value || null,is_assignable:$('#category-assignable').checked,description:$('#category-description').value || null,purpose:$('#category-purpose').value || null,exclusions:$('#category-exclusions').value || null,reason:$('#category-reason').value})});
   state.category = result.id; $('#selected-category').textContent = result.name; $('#category-dialog').close();
-  await categories(); $('#assign-button').disabled = !state.selected; notice('Категория создана. Индекс: sync_pending');
+  await categories(); updateReviewActions(); notice('Категория создана. Индекс: sync_pending');
+});
+listen('#product-search-form','submit',event => {
+  event.preventDefault();
+  productsOffset = 0;
+  return renderProducts();
+});
+listen('#products-previous','click',() => { productsOffset = Math.max(0,productsOffset - 50); return renderProducts(); });
+listen('#products-next','click',() => { productsOffset += 50; return renderProducts(); });
+
+let archiveAction;
+function confirmArchive(description, action) {
+  archiveAction = action;
+  $('#archive-description').textContent = description;
+  $('#archive-dialog').showModal();
+}
+listen('#archive-cancel','click',() => $('#archive-dialog').close());
+listen('#archive-confirm','click',async event => {
+  event.currentTarget.disabled = true;
+  $('#archive-dialog').close();
+  try {
+    await archiveAction();
+  } finally {
+    $('#archive-confirm').disabled = false;
+  }
+});
+listen('#archive-not-products','click',() => {
+  const jobId = state.job;
+  const expectedCount = state.notProductCount;
+  confirmArchive(`Удалить ${expectedCount} позиций со статусом «Не товар» из списка задания? Они останутся в исходных данных и отчёте.`, async () => {
+    const result = await api(`/import-jobs/${jobId}/archive-not-products`, {
+      method:'POST',body:JSON.stringify({expected_count:expectedCount})
+    });
+    if (jobId === state.job) {
+      state.offset = 0; state.selected = null; state.bulk.clear();
+      renderItemDetail(); updateBulk();
+      await refresh();
+    }
+    notice(`Скрыто позиций «Не товар»: ${result.archived_count}`);
+  });
+});
+
+let archivedCategory;
+let categoryArchivePlan;
+function resetCategoryArchivePlan() {
+  categoryArchivePlan = null;
+  $('#archive-category-impact').textContent = '';
+  $('#archive-category-confirm').hidden = true;
+  $('#archive-category-preview').hidden = false;
+}
+function openCategoryArchive(category) {
+  archivedCategory = category;
+  $('#archive-category-path').textContent = category.path_names.join(' → ');
+  const target = $('#archive-category-target');
+  target.replaceChildren(new Option('Без переноса', ''));
+  state.categories.filter(c => isAssignable(c) && !c.path_ids.includes(category.id))
+    .sort((a,b) => a.path_names.join(' / ').localeCompare(b.path_names.join(' / '), 'ru'))
+    .forEach(c => target.add(new Option(c.path_names.join(' → '), c.id)));
+  resetCategoryArchivePlan();
+  $('#archive-category-dialog').showModal();
+}
+listen('#manage-category-search','input',renderAllCategories);
+listen('#archive-category-cancel','click',() => $('#archive-category-dialog').close());
+listen('#archive-category-target','change',resetCategoryArchivePlan);
+listen('#archive-category-preview','click',async event => {
+  const button = event.currentTarget;
+  const target = $('#archive-category-target');
+  const category = archivedCategory;
+  const targetId = target.value;
+  button.disabled = target.disabled = true;
+  try {
+    const proposal = await api('/taxonomy/change-sets', {method:'POST',body:JSON.stringify({
+      action:'deactivate',category_id:category.id,target_category_id:targetId || null,
+      reason:'Удаление категории из каталога оператором'
+    })});
+    if (!$('#archive-category-dialog').open || archivedCategory !== category || target.value !== targetId) return;
+    categoryArchivePlan = proposal;
+    const plan = categoryArchivePlan.preview;
+    const referenceCount = Object.values(plan.references).reduce((sum,count) => sum + count, 0);
+    const impact = target.value ? `Связи будут перенаправлены в «${target.selectedOptions[0].text}».` :
+      'Исторические связи сохранятся.';
+    $('#archive-category-impact').textContent = `Активных товаров: ${plan.active_products}. Связей: ${referenceCount}. ${impact}`;
+    $('#archive-category-confirm').hidden = false;
+    button.hidden = true;
+  } catch (error) {
+    if (archivedCategory === category) $('#archive-category-impact').textContent = error.message;
+  } finally {
+    button.disabled = target.disabled = false;
+  }
+});
+listen('#archive-category-confirm','click',async event => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  try {
+    const plan = categoryArchivePlan;
+    await api(`/taxonomy/change-sets/${plan.id}/apply`, {method:'POST',body:JSON.stringify({expected_sha256:plan.preview_sha256})});
+    $('#archive-category-dialog').close();
+    await categories();
+    renderAllCategories();
+    await refresh();
+    notice('Категория удалена из каталога. Индекс синхронизируется.');
+  } catch (error) {
+    resetCategoryArchivePlan();
+    $('#archive-category-impact').textContent = error.message;
+    fail(error);
+  } finally {
+    button.disabled = false;
+  }
 });
 listen('#reindex-button','click',async () => { await api('/taxonomy/reindex',{method:'POST'}); notice('Запрошена синхронизация индекса'); });
 async function indexStatus() { const result = await api('/taxonomy/index-status'); $('#index-status').textContent = `Qdrant: ${result.status} · очередь ${result.pending_events}`; }

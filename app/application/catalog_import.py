@@ -16,7 +16,11 @@ from app.application.catalog_ports import (
     JobQueue,
     Understanding,
 )
-from app.application.category_selection import CategoryClassifier
+from app.application.category_selection import (
+    CategoryClassifier,
+    candidate_view,
+    suggested_category_ids,
+)
 from app.domain.catalog import (
     NORMALIZER_VERSION,
     TERMINAL_ITEMS,
@@ -545,6 +549,8 @@ class CatalogImport:
                         else None
                     )
                 unit.freeze_taxonomy()
+                if self.keep_archived_product(unit, item, linked_product):
+                    return
                 category = unit.assignable_path(decision["category_id"])
                 if category:
                     linked_product = self.ensure_assignment_product(unit, item, linked_product)
@@ -640,6 +646,8 @@ class CatalogImport:
                 product = None
             if product is None and previous:
                 product = unit.get("products", previous[-1]["product_id"])
+            if product and self.keep_archived_product(unit, item, product["id"]):
+                return
             if product is None:
                 product = self.create_provisional(unit, item, fields, answer)
             unit.add(
@@ -783,6 +791,9 @@ class CatalogImport:
             if fresh["processing_version"] != item["processing_version"]:
                 return
             existing = unit.get("products", product_id, lock=True) if product_id else None
+            if existing and existing["status"] == "retired":
+                self.finish_item(unit, item, "needs_review", product_id=product_id)
+                return
             if (
                 existing
                 and existing["category_id"]
@@ -851,6 +862,9 @@ class CatalogImport:
         with self.store.transaction() as unit:
             unit.freeze_taxonomy()
             product = unit.get("products", product_id, lock=True) if product_id else None
+            if product and product["status"] == "retired":
+                self.finish_item(unit, item, "needs_review", product_id=product_id)
+                return True
             decisions = unit.all("classification_decisions", normalized_record_id=norm["id"])
             for decision in sorted(decisions, key=lambda row: row["created_at"], reverse=True):
                 if (
@@ -858,8 +872,11 @@ class CatalogImport:
                     and decision["category_id"]
                     and (product_id is None or decision["product_id"] in {None, product_id})
                     and (not product or product["category_id"] == decision["category_id"])
-                    and unit.assignable_path(decision["category_id"])
                 ):
+                    if self.keep_archived_product(unit, item, decision["product_id"]):
+                        return True
+                    if not unit.assignable_path(decision["category_id"]):
+                        continue
                     product_id = self.ensure_assignment_product(
                         unit, item, product_id, decision["evidence"].get("answer_1")
                     )
@@ -913,6 +930,13 @@ class CatalogImport:
                     evidence={"approved_sql_hint": True, "answer_1": explicit_type},
                 )
                 return True
+        return False
+
+    def keep_archived_product(self, unit, item: dict, product_id) -> bool:
+        """Сохраняет связь с удалённым из каталога товаром без повторного создания."""
+        if product_id and unit.get("products", product_id, lock=True)["status"] == "retired":
+            self.finish_item(unit, item, "needs_review", product_id=product_id)
+            return True
         return False
 
     def create_provisional(
@@ -1160,21 +1184,16 @@ class CatalogImport:
             )
         )
 
-    def reclassify(self, job_id, apply: bool = False) -> dict:
+    def reclassify(self, job_id, apply: bool = False, *, only_remaining: bool = False) -> dict:
         """Ставит прежние нерешённые позиции в очередь без чтения файлов и matching."""
         with self.store.transaction() as unit:
             job = unit.get("ingest_jobs", job_id, lock=apply)
             if job["status"] not in {"completed", "completed_with_issues"}:
                 raise ConflictError("Повторная классификация доступна после завершения задания")
-            items = unit.reclassification_items(job["id"])
+            items = unit.reclassification_items(job["id"], only_remaining)
+            if apply:
+                items = [item for item in items if unit.queue_reclassification(item)]
             if apply and items:
-                for item in items:
-                    unit.update(
-                        "ingest_job_items",
-                        item["id"],
-                        status="pending",
-                        issue_codes=sorted(set(item["issue_codes"]) | {"reclassify_requested"}),
-                    )
                 unit.update(
                     "ingest_jobs",
                     job["id"],
@@ -1196,6 +1215,54 @@ class CatalogImport:
                 # Worker публикует оставшиеся queued задания из PostgreSQL.
                 pass
         return {"id": str(job_id), "eligible": len(items), "queued": bool(apply and items)}
+
+    def archive_product(self, product_id, actor: str, key: str) -> dict:
+        """Убирает Product из каталога, оставляя связи со строками и решениями."""
+        request = {"operation": "archive_product", "product_id": str(product_id)}
+        with self.store.transaction() as unit:
+            cached = unit.command(actor, key, request)
+            if cached:
+                return cached
+            unit.freeze_taxonomy()
+            product = unit.get("products", product_id, lock=True)
+            result = {
+                "id": str(product["id"]),
+                "status": "retired",
+                **unit.retire_product(product_id),
+            }
+            unit.save_command(actor, key, request, result)
+        return result
+
+    def archive_not_products(self, job_id, expected_count: int, actor: str, key: str) -> dict:
+        """Атомарно скрывает подтверждённое число строк «Не товар» одного задания."""
+        request = {
+            "operation": "archive_not_products",
+            "job_id": str(job_id),
+            "expected_count": expected_count,
+        }
+        with self.store.transaction() as unit:
+            cached = unit.command(actor, key, request)
+            if cached:
+                return cached
+            job = unit.get("ingest_jobs", job_id, lock=True)
+            if job["status"] not in {"completed", "completed_with_issues"}:
+                raise ConflictError("Удаление доступно после завершения задания")
+            rows = unit.unarchived_not_products(job_id, lock=True)
+            if not rows or len(rows) != expected_count:
+                raise ConflictError("Список «Не товар» изменился. Обновите задание.")
+            for item in rows:
+                unit.update(
+                    "ingest_job_items",
+                    item["id"],
+                    issue_codes=[*item["issue_codes"], "archived_not_product"],
+                    processing_version=item["processing_version"] + 1,
+                )
+            result = {"id": str(job_id), "archived_count": len(rows)}
+            unit.event(
+                job_id, "job.not_products_archived", "Позиции «Не товар» скрыты", data=result
+            )
+            unit.save_command(actor, key, request, result)
+        return result
 
     def control(self, job_id, action: str) -> dict:
         """Cancel сохраняет checkpoints; resume явно повторяет только технические ошибки."""
@@ -1268,11 +1335,45 @@ class CatalogImport:
             unit.get("ingest_jobs", job_id)
             return json_value(unit.items_page(job_id, status, query, offset, limit))
 
+    def item_detail(self, item_id, job_id=None) -> dict:
+        """Показывает объяснение по последнему решению и пригодные для назначения варианты."""
+        with self.store.transaction() as unit:
+            detail = unit.item_details(item_id)
+            item = detail["item"]
+            if job_id is not None and item["job_id"] != job_id:
+                raise CatalogError("Позиция не принадлежит заданию")
+            latest = max(
+                (d for d in detail["decisions"] if d["status"] != "superseded"),
+                key=lambda d: d["created_at"],
+                default=None,
+            )
+            evidence = latest["evidence"] if latest else {}
+            detail["classification_reason"] = evidence.get("reason")
+            detail["suggested_categories"] = []
+            if (
+                latest
+                and item["status"] == "needs_review"
+                and latest["status"] in {"needs_review", "proposed"}
+                and (not detail["product"] or detail["product"]["status"] != "retired")
+            ):
+                name = detail["normalized"]["attributes"]["fields"]["name"]
+                for category_id in suggested_category_ids(latest):
+                    row = unit.assignable_path(category_id)
+                    if row:
+                        candidate = candidate_view(row)
+                        if not approved_category_exclusion(name, candidate):
+                            detail["suggested_categories"].append(candidate)
+                    if len(detail["suggested_categories"]) == 5:
+                        break
+            return json_value(detail)
+
     def report(self, job_id) -> dict:
         """Отчёт отражает фактические counters, issues и provenance без секретов."""
         with self.store.transaction() as unit:
             job = self.job_summary(unit, job_id)
-            rows = unit.items_page(job_id, None, "", 0, self.settings.upload_max_rows)["items"]
+            rows = unit.items_page(
+                job_id, None, "", 0, self.settings.upload_max_rows, include_archived=True
+            )["items"]
             files = unit.all("ingest_job_files", job_id=job["id"])
             norm_ids = list({r["normalized_record_id"] for r in rows if r["normalized_record_id"]})
             normalized = {n["id"]: n for n in unit.related("normalized_records", "id", norm_ids)}
@@ -1416,7 +1517,9 @@ class CatalogImport:
     def decide(self, item_id, values: dict, actor: str, key: str) -> dict:
         """Ручное назначение имеет приоритет; identity matching остаётся отдельной командой."""
         request = {"operation": "review", "item_id": str(item_id), **values}
-        if not normalize_text(values.get("reason")):
+        action = values.get("action", "assign_category")
+        reason = normalize_text(values.get("reason")) or ""
+        if not reason and action != "assign_category":
             raise CatalogError("Укажите основание решения")
         with self.store.transaction() as unit:
             cached = unit.command(actor, key, request)
@@ -1425,14 +1528,21 @@ class CatalogImport:
             item = unit.get("ingest_job_items", item_id)
             unit.lock_record(item["normalized_record_id"])
             item = unit.get("ingest_job_items", item_id, lock=True)
-            if item["processing_version"] != values.get("expected_version"):
+            if (
+                item["processing_version"] != values.get("expected_version")
+                or "archived_not_product" in item["issue_codes"]
+            ):
                 raise ConflictError("Позиция изменилась; обновите данные")
             category_id = UUID(values["category_id"]) if values.get("category_id") else None
-            action = values.get("action", "assign_category")
             if action == "assign_category":
                 unit.freeze_taxonomy()
                 if not unit.assignable_path(category_id):
                     raise CatalogError("Категория недоступна для назначения")
+                if (
+                    item["product_id"]
+                    and unit.get("products", item["product_id"], lock=True)["status"] == "retired"
+                ):
+                    raise ConflictError("Товар удалён из каталога")
                 product_id = self.ensure_assignment_product(unit, item, item["product_id"])
                 for decision in unit.all(
                     "classification_decisions", normalized_record_id=item["normalized_record_id"]
@@ -1447,7 +1557,7 @@ class CatalogImport:
                     method="manual",
                     selection_type="exact",
                     status="approved",
-                    evidence={"reason": values["reason"]},
+                    evidence={"reason": reason},
                     decided_by=actor,
                 )
                 affected_jobs = unit.assign_record_items(
@@ -1484,7 +1594,7 @@ class CatalogImport:
                     selection_type="none",
                     status="approved",
                     decided_by=actor,
-                    evidence={"manual_action": action, "reason": values["reason"]},
+                    evidence={"manual_action": action, "reason": reason},
                 )
                 unit.update(
                     "ingest_job_items",
@@ -1500,7 +1610,8 @@ class CatalogImport:
                 )
                 if product_id is None:
                     raise CatalogError("Выберите Product отдельно от Category")
-                unit.get("products", product_id, lock=True)
+                if unit.get("products", product_id, lock=True)["status"] == "retired":
+                    raise ConflictError("Товар удалён из каталога")
                 unit.add(
                     "product_match_decisions",
                     normalized_record_id=item["normalized_record_id"],
@@ -1603,10 +1714,8 @@ class CatalogImport:
         rows = values.get("items", [])
         if not rows or len(rows) > 200 or len({r["id"] for r in rows}) != len(rows):
             raise CatalogError("Выберите от 1 до 200 разных позиций")
-        if not self.valid_category(values.get("category_id")) or not normalize_text(
-            values.get("reason")
-        ):
-            raise CatalogError("Укажите категорию и основание пакетного назначения")
+        if not self.valid_category(values.get("category_id")):
+            raise CatalogError("Укажите доступную категорию для пакетного назначения")
         preview = []
         with self.store.transaction() as unit:
             for selected in rows:
@@ -1618,13 +1727,15 @@ class CatalogImport:
         return {
             "items": preview,
             "category_id": values["category_id"],
-            "reason": values["reason"],
+            "reason": values.get("reason", ""),
             "preview_sha256": fingerprint(values),
         }
 
     def bulk_apply(self, values: dict, actor: str, key: str) -> dict:
         """Каждое назначение атомарно; конфликты возвращаются явно, без скрытого overwrite."""
-        request = {k: values[k] for k in ("items", "category_id", "reason")}
+        request = {"items": values["items"], "category_id": values["category_id"]}
+        if "reason" in values:
+            request["reason"] = values["reason"]
         if fingerprint(request) != values.get("preview_sha256"):
             raise CatalogError("Пакет отличается от подтверждённого preview")
         if not request["items"] or len(request["items"]) > 200:
@@ -1641,7 +1752,7 @@ class CatalogImport:
                         {
                             "action": "assign_category",
                             "category_id": request["category_id"],
-                            "reason": request["reason"],
+                            "reason": request.get("reason", ""),
                             "expected_version": selected["expected_version"],
                         },
                         actor,

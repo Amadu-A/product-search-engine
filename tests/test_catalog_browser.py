@@ -14,11 +14,13 @@ import uvicorn
 from openpyxl import Workbook
 from playwright.sync_api import expect, sync_playwright
 
+from app.application.category_selection import CategorySelection, candidate_view
 from app.catalog_bootstrap import build_catalog
 from app.presentation.api import create_app
 from app.settings import Settings
 from tests.catalog_fixture import restore_categories
 from tests.test_catalog_pipeline import catalog as catalog
+from tests.test_catalog_pipeline import input_file, run_import
 
 pytestmark = [pytest.mark.integration, pytest.mark.e2e]
 
@@ -42,6 +44,140 @@ def browser_workspace(catalog):
     finally:
         server.should_exit = True
         thread.join(timeout=10)
+
+
+def test_review_remaining_and_archive_over_http(browser_workspace, tmp_path, monkeypatch):
+    """Оператор утверждает вариант, повторяет остаток и подтверждает удаление с историей."""
+    service, address = browser_workspace
+    manual = service.create_category(
+        {"name": "Контрольная категория", "reason": "Тест"}, "test", "c"
+    )
+    auto = service.create_category({"name": "Вторая категория", "reason": "Тест"}, "test", "c2")
+    rows = {str(row["id"]): candidate_view(row) for row in service.store.categories()}
+    retry = False
+
+    def choose(fields, answer, emit):
+        """Возвращает воспроизводимые варианты и один подтверждённый пробел в дереве."""
+        if fields["name"] == "Лоток без ветки":
+            return CategorySelection(reason="Для изделия нет подходящей ветки")
+        if retry:
+            return CategorySelection(category=rows[auto["id"]], selection_type="exact")
+        return CategorySelection(
+            unresolved=True,
+            reason="Недостаточно сведений для выбора подкатегории",
+            candidates=[rows[manual["id"]]],
+            evidence={
+                "answer_2": {"status": "needs_review", "compared_candidate_ids": [manual["id"]]}
+            },
+        )
+
+    monkeypatch.setattr(service.classifier, "select", choose)
+    source_path = input_file(
+        tmp_path,
+        [
+            {"name": "Кабель для проверки", "price": "10"},
+            {"name": "Кабель для повтора"},
+            {"name": "Лоток без ветки"},
+            {"name": "Каталог коллекция кабелей"},
+            {"name": "Каталог коллекция выключателей"},
+        ],
+    )
+    job = run_import(service, source_path)
+    errors = []
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(
+            args=[
+                "--no-sandbox",
+                "--host-resolver-rules=MAP pse.test 127.0.0.1",
+                "--no-proxy-server",
+            ]
+        )
+        page = browser.new_page(viewport={"width": 1500, "height": 1000})
+        page.on("pageerror", lambda error: errors.append(str(error)))
+        page.goto(address.replace("127.0.0.1", "pse.test") + "/admin/import?job=" + job)
+        assert page.evaluate("isSecureContext") is False
+        page.get_by_role("button", name="Кабель для проверки", exact=True).click()
+        expect(page.locator("#detail-summary")).to_contain_text("Кабель")
+        expect(page.locator("#detail-reason")).to_have_text(
+            "Недостаточно сведений для выбора подкатегории"
+        )
+        expect(page.locator("#detail-technical")).not_to_have_attribute("open", "")
+        expect(page.locator("#detail-raw")).not_to_be_visible()
+        expect(page.get_by_text("Подтвердить Product", exact=True)).to_have_count(0)
+        page.get_by_role("button", name="Утвердить: Контрольная категория").click()
+        expect(page.locator("#manual-assigned-count")).to_have_text("1")
+        expect(page.locator("#suggestions")).not_to_be_visible()
+
+        retry = True
+        page.get_by_role("button", name="Распределить оставшиеся").click()
+        expect(page.locator("#notice")).to_contain_text("Поставлено на повторную классификацию: 1")
+        assert service.store.claim_job(job) == job
+        service.process(job)
+        expect(page.locator("#auto-assigned-count")).to_have_text("1")
+        expect(page.locator("#gap-count")).to_have_text("1")
+        expect(page.locator("#not-product-count")).to_have_text("2")
+
+        stale = page.request.post(
+            f"{address}/api/v1/import-jobs/{job}/archive-not-products",
+            headers={"Idempotency-Key": "stale-count"},
+            data={"expected_count": 1},
+        )
+        assert stale.status == 409
+        page.locator("#archive-not-products").click()
+        page.locator("#archive-cancel").click()
+        expect(page.locator("#not-product-count")).to_have_text("2")
+        page.locator("#archive-not-products").click()
+        page.locator("#archive-confirm").click()
+        expect(page.locator("#not-product-count")).to_have_text("0")
+        report = service.report(job)
+        assert report["job"]["archived_not_product_count"] == 2
+        assert len(report["items"]) == 5 and report["statuses"]["not_product"] == 2
+
+        page.get_by_role("button", name="Категории", exact=True).first.click()
+        page.locator("#manage-category-search").fill("Контрольная категория")
+        page.locator("#all-categories button").click()
+        page.locator("#archive-category-preview").click()
+        expect(page.locator("#archive-category-impact")).to_contain_text("есть активные товары")
+        expect(page.locator("#archive-category-confirm")).not_to_be_visible()
+        page.locator("#archive-category-cancel").click()
+
+        page.get_by_role("button", name="Товары", exact=True).click()
+        product = page.locator("#products li", has_text="Кабель для проверки")
+        product.get_by_role("button", name="Удалить товар").click()
+        page.locator("#archive-confirm").click()
+        expect(product).to_have_count(0)
+        with service.store.transaction() as unit:
+            assigned = next(row for row in report["items"] if row["assignment_origin"] == "manual")
+            assert unit.get("products", assigned["product_id"])["status"] == "retired"
+            assert unit.get("ingest_job_items", assigned["id"])["product_id"]
+            assert (
+                unit.all("offers", product_id=UUID(assigned["product_id"]))[0]["status"]
+                == "retired"
+            )
+            assert (
+                unit.all("classification_decisions", method="manual")[0]["evidence"]["reason"] == ""
+            )
+
+        page.get_by_role("button", name="Категории", exact=True).first.click()
+        page.locator("#all-categories button").click()
+        page.locator("#archive-category-preview").click()
+        expect(page.locator("#archive-category-impact")).to_contain_text(
+            "Исторические связи сохранятся"
+        )
+        page.locator("#archive-category-confirm").click()
+        expect(page.locator("#all-categories li")).to_have_count(0)
+        with service.store.transaction() as unit:
+            assert not unit.get("categories", manual["id"])["is_active"]
+            assert unit.get("products", assigned["product_id"])["category_id"] == UUID(manual["id"])
+        replay = service.report(run_import(service, source_path))
+        archived = next(item for item in replay["items"] if item["name"] == assigned["name"])
+        assert (
+            archived["status"] == "needs_review"
+            and archived["product_id"] == assigned["product_id"]
+        )
+        assert replay["database_counts"]["products"] == report["database_counts"]["products"]
+        assert not errors
+        browser.close()
 
 
 def test_browser_mapping_sheets_bulk_and_safe_text(browser_workspace, tmp_path):

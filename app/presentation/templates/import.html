@@ -9,7 +9,7 @@
 </head>
 <body data-mode="{{ mode }}" data-mobile-tab="file">
 <header class="header"><a class="header__brand" href="/admin/import"><span aria-hidden="true">◈</span> Product Search Engine</a>
-  <nav aria-label="Разделы"><button type="button" data-view="import" aria-current="page">Импорт</button><button type="button" data-view="categories">Категории</button><button type="button" data-view="review">Проверка</button><button type="button" data-view="history">История</button></nav>
+  <nav aria-label="Разделы"><button type="button" data-view="import" aria-current="page">Импорт</button><button type="button" data-view="categories">Категории</button><button type="button" data-view="products">Товары</button><button type="button" data-view="review">Проверка</button><button type="button" data-view="history">История</button></nav>
   <a href="/docs">Swagger ↗</a><span id="index-status" role="status">Индекс: проверка…</span>
 </header>
 <div id="notice" class="notice" role="status" aria-live="polite"></div>
@@ -58,17 +58,54 @@
     </section>
     <section class="panel review"><div class="section-heading"><h2>Позиции и ручная проверка</h2><span id="items-total">0 позиций</span></div>
       <div class="toolbar"><label>Поиск<input id="item-search" type="search" placeholder="Наименование"></label><label>Статус<select id="item-status"><option value="">Все</option><option value="needs_review">На проверке</option><option value="taxonomy_gap">Нет категории</option><option value="assigned">Назначено</option><option value="not_product">Не товар</option><option value="invalid_record">Некорректные</option><option value="error">Ошибки</option></select></label></div>
-      <button id="bulk-preview" type="button" disabled>Назначить выбранным (0)</button>
-      <div class="review__panes"><div class="review__list"><div class="table-wrap"><table><thead><tr><th aria-label="Выбор"></th><th>Наименование</th><th>Статус</th><th>Категория</th></tr></thead><tbody id="items"></tbody></table></div><div class="pagination"><button id="previous" type="button">←</button><span id="page-label">1</span><button id="next" type="button">→</button></div></div>
-        <section class="review__details" aria-label="Данные позиции"><h3 id="detail-title">Выберите позицию</h3><p id="detail-summary" class="muted">Raw, нормализация, ответы и решения сохраняются раздельно.</p><div id="detail-issues"></div><details><summary>Исходная запись</summary><pre id="detail-raw"></pre></details><details><summary>Ответы и история решений</summary><pre id="detail-trace"></pre></details><div class="review__identity"><button id="confirm-product" disabled type="button">Подтвердить Product</button><button id="reject-product" disabled type="button">Не объединять</button></div></section>
-        <section class="review__tree" aria-label="Выбор категории"><h3>Назначить категорию</h3><label>Поиск в дереве<input id="category-search" type="search" placeholder="Название или путь"></label><div id="category-tree" class="tree" role="group" aria-label="Дерево категорий"></div><p id="selected-category" class="muted">Категория не выбрана</p><label>Основание решения<input id="decision-reason" maxlength="2000" placeholder="Почему подходит категория"></label><button id="assign-button" class="button button--primary" type="button" disabled>Назначить категорию</button><button id="new-category" type="button">+ Создать категорию</button></section>
+      <div class="toolbar review__actions">
+        <button id="reclassify-button" type="button" disabled>Распределить оставшиеся</button>
+        <button id="bulk-preview" type="button" disabled>Назначить выбранным (0)</button>
+        <button id="archive-not-products" type="button" hidden>Удалить позиции «Не товар»</button>
       </div>
-      <div class="toolbar"><button id="confirm-proposal" disabled type="button">Подтвердить предложение</button><button id="mark-not-product" disabled type="button">Не является товаром</button><button id="leave-uncategorized" disabled type="button">Оставить без категории</button></div>
+      <div class="review__panes"><div class="review__list"><div class="table-wrap"><table><thead><tr><th aria-label="Выбор"></th><th>Наименование</th><th>Статус</th><th>Категория</th></tr></thead><tbody id="items"></tbody></table></div><div class="pagination"><button id="previous" type="button">←</button><span id="page-label">1</span><button id="next" type="button">→</button></div></div>
+        <section class="review__details" aria-label="Данные позиции">
+          <h3 id="detail-title">Выберите позицию</h3>
+          <p id="detail-summary" class="muted"></p>
+          <p id="detail-reason" hidden></p>
+          <section id="suggestions" hidden>
+            <h4>Предложенные категории</h4>
+            <ul id="suggested-categories" class="review__suggestions"></ul>
+          </section>
+          <details id="detail-technical" hidden>
+            <summary>Технические данные</summary>
+            <h4>Исходная запись</h4><pre id="detail-raw"></pre>
+            <h4>Обработка и решения</h4><pre id="detail-trace"></pre>
+          </details>
+        </section>
+        <section class="review__tree" aria-label="Выбор категории"><h3>Назначить категорию</h3><label>Поиск в дереве<input id="category-search" type="search" placeholder="Название или путь"></label><div id="category-tree" class="tree" role="group" aria-label="Дерево категорий"></div><p id="selected-category" class="muted">Категория не выбрана</p><label>Комментарий (необязательно)<input id="decision-reason" maxlength="2000"></label><button id="assign-button" class="button button--primary" type="button" disabled>Назначить категорию</button><button id="new-category" type="button">+ Создать категорию</button></section>
+      </div>
+      <div class="toolbar"><button id="mark-not-product" disabled type="button">Не является товаром</button><button id="leave-uncategorized" disabled type="button">Оставить без категории</button></div>
     </section>
   </div>
 </main>
 <dialog id="bulk-dialog"><h2>Проверить пакетное назначение</h2><p id="bulk-target"></p><ul id="bulk-items"></ul><button id="bulk-cancel" type="button">Отмена</button><button id="bulk-confirm" class="button button--primary" type="button">Подтвердить назначение выбранным</button></dialog>
 <section id="history-view" class="panel alternate" hidden><h1>История импортов</h1><div id="history"></div></section>
-<section id="categories-view" class="panel alternate" hidden><div class="section-heading"><h1>Категории</h1><button id="reindex-button" type="button">Синхронизировать индекс</button></div><p>UUID и родительские связи хранятся в PostgreSQL. Индекс — восстанавливаемая проекция.</p><div id="all-categories"></div></section>
+<section id="categories-view" class="panel alternate" hidden>
+  <div class="section-heading"><h1>Категории</h1><button id="reindex-button" type="button">Синхронизировать индекс</button></div>
+  <label>Поиск категории<input id="manage-category-search" type="search" placeholder="Название или путь"></label>
+  <p id="category-list-count" class="muted"></p><ul id="all-categories" class="catalog-list"></ul>
+</section>
+<section id="products-view" class="panel alternate" hidden>
+  <h1>Товары</h1>
+  <form id="product-search-form" class="toolbar"><label>Поиск товара<input id="product-search" type="search" maxlength="200" placeholder="Наименование"></label><button type="submit">Найти</button></form>
+  <p id="product-count" role="status"></p><ul id="products" class="catalog-list"></ul>
+  <div class="pagination"><button id="products-previous" type="button" aria-label="Предыдущая страница товаров">←</button><button id="products-next" type="button" aria-label="Следующая страница товаров">→</button></div>
+</section>
+<dialog id="archive-dialog" aria-labelledby="archive-title">
+  <h2 id="archive-title">Подтвердить удаление</h2><p id="archive-description"></p>
+  <div class="toolbar"><button type="button" id="archive-cancel" autofocus>Отмена</button><button type="button" id="archive-confirm">Удалить</button></div>
+</dialog>
+<dialog id="archive-category-dialog" aria-labelledby="archive-category-title">
+  <h2 id="archive-category-title">Удалить категорию</h2><p id="archive-category-path"></p>
+  <label>Перенести связанные записи<select id="archive-category-target"><option value="">Без переноса</option></select></label>
+  <p id="archive-category-impact" role="status"></p>
+  <div class="toolbar"><button type="button" id="archive-category-cancel" autofocus>Отмена</button><button type="button" id="archive-category-preview">Проверить связи</button><button type="button" id="archive-category-confirm" hidden>Удалить категорию</button></div>
+</dialog>
 <dialog id="category-dialog"><form id="category-form"><h2>Новая категория</h2><label>Название<input id="category-name" required maxlength="512"></label><label>Родитель<select id="category-parent"><option value="">Корневая категория</option></select></label><label class="check"><input id="category-assignable" type="checkbox" checked> Разрешено назначать товары</label><label>Описание<textarea id="category-description" maxlength="10000"></textarea></label><label>Назначение<textarea id="category-purpose" maxlength="10000"></textarea></label><label>Исключения<textarea id="category-exclusions" maxlength="10000"></textarea></label><label>Основание<input id="category-reason" required maxlength="2000"></label><div class="toolbar"><button type="button" id="close-dialog">Отмена</button><button class="button button--primary" type="submit">Создать категорию</button></div></form></dialog>
 </body></html>

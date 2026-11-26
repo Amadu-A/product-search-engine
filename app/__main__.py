@@ -80,6 +80,9 @@ def parser() -> argparse.ArgumentParser:
     report.add_argument("--summary", action="store_true")
     reclassify = commands.add_parser("reclassify", help="Повторная классификация записей задания")
     reclassify.add_argument("--job-id", required=True)
+    reclassify.add_argument(
+        "--only-remaining", action="store_true", help="Только позиции на автоматической проверке"
+    )
     reclassify.add_argument("--apply", action="store_true")
     decision = commands.add_parser("review-item")
     decision.add_argument("--item-id", required=True)

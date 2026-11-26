@@ -8,7 +8,11 @@ from uuid import UUID
 import httpx
 import pytest
 
-from app.application.category_selection import candidate_view
+from app.application.category_selection import (
+    CategorySelection,
+    candidate_view,
+    suggested_category_ids,
+)
 from app.domain.catalog import (
     DependencyUnavailable,
     InvalidModelOutput,
@@ -273,8 +277,6 @@ def test_approved_category_exclusion(name, conflict):
 @pytest.mark.integration
 def test_bath_accessories_are_not_grounded_by_the_shape_of_a_tray(catalog):
     """Вид изделия сам по себе не подтверждает узкое назначение выбранной ветки."""
-    from app.application.category_selection import CategorySelection
-
     candidate = {
         "category_id": "candidate-from-tree",
         "path_names": ["Сантехника", "Аксессуары для ванной комнаты"],
@@ -287,6 +289,95 @@ def test_bath_accessories_are_not_grounded_by_the_shape_of_a_tray(catalog):
     )
     assert result.category is None
     assert result.reason == "Исходные сведения не подтверждают назначение ветки"
+
+
+def test_review_suggestions_use_only_compared_and_not_rejected_categories():
+    """Предложения берутся из ответов моделей и ограничены входами соответствующего шага."""
+    decision = {
+        "status": "needs_review",
+        "category_id": None,
+        "candidates": [{"category_id": "hierarchy"}],
+        "evidence": {
+            "hybrid": {
+                "candidates": [{"category_id": "hybrid"}, {"category_id": "uncompared"}],
+                "answer_2": {
+                    "status": "needs_review",
+                    "compared_candidate_ids": ["hybrid", "outside"],
+                },
+            },
+            "hierarchical_steps": [
+                {
+                    "allowed_ids": ["hierarchy"],
+                    "answer_3": {"action": "select_child", "category_id": "hierarchy"},
+                },
+                {
+                    "allowed_ids": [],
+                    "answer_3": {"action": "select_current", "category_id": "hierarchy"},
+                },
+            ],
+        },
+    }
+    assert suggested_category_ids(decision) == ["hierarchy", "hybrid"]
+    decision["evidence"].update(
+        semantic_check={"status": "no_suitable_category"},
+        semantic_check_candidates=[{"category_id": "hierarchy"}],
+    )
+    assert suggested_category_ids(decision) == ["hybrid"]
+
+
+@pytest.mark.integration
+def test_scope_check_can_accept_valid_parent_of_overly_narrow_choice(catalog, monkeypatch):
+    """Ответ 2 сравнивает подтверждённую широкую категорию с ошибочным узким выбором."""
+    root = catalog.create_category({"name": "Электрика", "reason": "Фикстура"}, "test", "electric")
+    wires = catalog.create_category(
+        {"name": "Кабель и провод", "parent_id": root["id"], "reason": "Фикстура"},
+        "test",
+        "wires",
+    )
+    power = catalog.create_category(
+        {"name": "Силовой кабель", "parent_id": wires["id"], "reason": "Фикстура"},
+        "test",
+        "power",
+    )
+    rows = catalog.store.categories()
+    candidate = candidate_view(next(row for row in rows if str(row["id"]) == power["id"]))
+
+    def compare(step, values):
+        """Не подтверждает подтип, для которого в наименовании недостаточно сведений."""
+        assert step == 2
+        options = values["category_candidates_json"]
+        allowed = [entry["category_id"] for entry in options]
+        if allowed == [power["id"]]:
+            return {
+                "status": "no_suitable_category",
+                "category_id": None,
+                "selection_type": "none",
+                "reason": "Силовой тип не подтверждён",
+                "supporting_evidence_ids": [],
+                "compared_candidate_ids": allowed,
+            }
+        assert allowed == [wires["id"]]
+        return {
+            "status": "selected",
+            "category_id": wires["id"],
+            "selection_type": "broader",
+            "reason": "Это кабель, подтип не подтверждён",
+            "supporting_evidence_ids": ["raw_name"],
+            "compared_candidate_ids": allowed,
+        }
+
+    monkeypatch.setattr(catalog.inference, "mock_answer", compare)
+    with catalog.inference.budget() as usage:
+        result = catalog.classifier.verify_hierarchy(
+            CategorySelection(category=candidate, selection_type="exact", strategy="hierarchical"),
+            {"name": "Кабель связи"},
+            {"product_type": "Кабель", "evidence_ids": ["raw_name"], "attributes": []},
+            rows,
+        )
+    assert result.category["category_id"] == wires["id"]
+    assert result.selection_type == "broader"
+    assert usage["vlm_requests"] == 2
+    assert result.evidence["semantic_check_declined_ids"] == [power["id"]]
 
 
 @pytest.mark.integration

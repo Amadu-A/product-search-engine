@@ -85,7 +85,7 @@ def dispatch_catalog(args, settings) -> dict:
             result.pop("items")
         return result
     if args.command == "reclassify":
-        return service.reclassify(args.job_id, apply=args.apply)
+        return service.reclassify(args.job_id, apply=args.apply, only_remaining=args.only_remaining)
     if args.command == "review-item":
         return service.decide(
             args.item_id,

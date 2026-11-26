@@ -62,7 +62,7 @@ class DecisionInput(BaseModel):
     expected_version: int = Field(ge=1)
     category_id: UUID | None = None
     product_id: UUID | None = None
-    reason: str = Field(min_length=1, max_length=2000)
+    reason: str = Field(default="", max_length=2000)
 
 
 class BulkItem(BaseModel):
@@ -77,7 +77,7 @@ class BulkInput(BaseModel):
 
     items: list[BulkItem] = Field(min_length=1, max_length=200)
     category_id: UUID
-    reason: str = Field(min_length=1, max_length=2000)
+    reason: str = Field(default="", max_length=2000)
     preview_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
 
 
@@ -94,6 +94,18 @@ class ApplyChangeInput(BaseModel):
     """Утверждение неизменившегося preview changeset."""
 
     expected_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
+class ArchiveProductInput(BaseModel):
+    """Исключение товара из каталога требует явного подтверждения."""
+
+    confirm: Literal[True]
+
+
+class ArchiveNotProductsInput(BaseModel):
+    """Количество строк, указанное оператору на экране подтверждения."""
+
+    expected_count: int = Field(ge=1)
 
 
 def create_app(service=None) -> FastAPI:
@@ -243,6 +255,22 @@ def create_app(service=None) -> FastAPI:
         """Возвращает текущий status и счётчики."""
         return service.job(job_id)
 
+    @app.post("/api/v1/import-jobs/{job_id}/reclassify", status_code=202)
+    def reclassify(job_id: UUID):
+        """Повторяет автоматическую обработку строк на проверке после завершения задания."""
+        return service.reclassify(job_id, apply=True, only_remaining=True)
+
+    @app.post("/api/v1/import-jobs/{job_id}/archive-not-products")
+    def archive_not_products(
+        job_id: UUID,
+        values: ArchiveNotProductsInput,
+        idempotency_key: Annotated[str, Header(min_length=1, max_length=200)],
+    ):
+        """Скрывает строки «Не товар» текущего импорта, сохраняя исходные данные."""
+        return service.archive_not_products(
+            job_id, values.expected_count, "operator_unverified", idempotency_key
+        )
+
     @app.post("/api/v1/import-jobs/{job_id}/{action}", status_code=202)
     def control(job_id: UUID, action: Literal["cancel", "resume"]):
         """Сохраняет checkpoint при cancel и возобновляет технические ошибки."""
@@ -300,11 +328,7 @@ def create_app(service=None) -> FastAPI:
     @app.get("/api/v1/import-jobs/{job_id}/items/{item_id}")
     def item(job_id: UUID, item_id: UUID):
         """Возвращает полный trace только позиции указанного задания."""
-        with service.store.transaction() as unit:
-            detail = unit.item_details(item_id)
-        if detail["item"]["job_id"] != job_id:
-            raise CatalogError("Позиция не принадлежит заданию")
-        return json_value(detail)
+        return service.item_detail(item_id, job_id)
 
     @app.get("/api/v1/review/items")
     def review_items(job_id: UUID, offset: int = Query(0, ge=0)):
@@ -314,8 +338,7 @@ def create_app(service=None) -> FastAPI:
     @app.get("/api/v1/review/items/{item_id}")
     def review_detail(item_id: UUID):
         """Возвращает тот же trace, что карточка позиции import job."""
-        with service.store.transaction() as unit:
-            return json_value(unit.item_details(item_id))
+        return service.item_detail(item_id)
 
     @app.get("/api/v1/products")
     def products(
@@ -326,6 +349,15 @@ def create_app(service=None) -> FastAPI:
         """Просмотр Product без поля current price и без сетевого обхода магазинов."""
         with service.store.transaction() as unit:
             return json_value(unit.products_page(q, offset, limit))
+
+    @app.post("/api/v1/products/{product_id}/archive")
+    def archive_product(
+        product_id: UUID,
+        values: ArchiveProductInput,
+        idempotency_key: Annotated[str, Header(min_length=1, max_length=200)],
+    ):
+        """Подтверждённое исключение Product и его предложений из каталога."""
+        return service.archive_product(product_id, "operator_unverified", idempotency_key)
 
     @app.get("/api/v1/ingest-runs/{run_id}")
     def source_run(run_id: UUID):

@@ -35,6 +35,7 @@ class JobView(BaseModel):
     products_created_count: int = 0
     categorized_products_count: int = 0
     not_product_count: int = 0
+    archived_not_product_count: int = 0
     technical_error_count: int = 0
     needs_review_count: int
     taxonomy_gap_count: int

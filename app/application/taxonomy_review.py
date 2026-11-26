@@ -77,8 +77,9 @@ class TaxonomyReview:
             raise CatalogError("Сначала разберите дочерние ветви отдельным changeset")
         with self.store.transaction() as unit:
             refs = unit.category_references(UUID(old_id))
-        if action == "deactivate" and not target_id and any(refs.values()):
-            raise CatalogError("У категории есть ссылки; укажите target для переназначения")
+            active_products = unit.active_category_products(UUID(old_id))
+        if action == "deactivate" and not target_id and active_products:
+            raise CatalogError("У категории есть активные товары. Укажите категорию для переноса.")
         signature = [
             {
                 k: r[k]
@@ -102,6 +103,7 @@ class TaxonomyReview:
                 "target_category_id": target_id,
                 "old_path": old["path_names"],
                 "references": refs,
+                "active_products": active_products,
                 "tree_sha256": fingerprint(signature),
                 "reference_sha256": fingerprint(refs),
                 "physical_delete": False,
