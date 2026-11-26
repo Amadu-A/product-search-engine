@@ -389,6 +389,7 @@ class CategoryIndex:
                     "description": row["semantic_description"] if reviewed else None,
                     "purpose": row["semantic_purpose"] if reviewed else None,
                     "exclusions": row["semantic_exclusions"] if reviewed else None,
+                    "ancestor_exclusions": row["ancestor_exclusions"],
                     "score": scores.get(key, 0),
                     "retrieval_method": "lexical" if warnings else "rrf_dense_lexical",
                 }

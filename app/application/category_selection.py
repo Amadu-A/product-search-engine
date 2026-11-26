@@ -1,6 +1,7 @@
 # app/application/category_selection.py
 """Политика выбора категории и ограниченный обход дерева из PostgreSQL."""
 
+import re
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -9,7 +10,7 @@ from app.application.catalog_ports import CatalogStore, CategorySearch, Understa
 from app.domain.catalog import (
     DependencyUnavailable,
     InvalidModelOutput,
-    category_purpose_conflict,
+    approved_category_exclusion,
     json_value,
 )
 
@@ -23,8 +24,18 @@ def candidate_view(row: dict) -> dict:
             "category_id": row["id"],
             **{
                 key: row[key]
-                for key in ("name", "path_ids", "path_names", "is_assignable", "review_status")
+                for key in (
+                    "name",
+                    "path_ids",
+                    "path_names",
+                    "is_active",
+                    "is_assignable",
+                    "review_status",
+                )
             },
+            "ancestor_exclusions": row.get("ancestor_exclusions", []),
+            "aliases": row.get("aliases", []),
+            "review_status_allowed": row["review_status"] in {"approved", "provisional"},
             **{
                 key: row.get("semantic_" + key) if row["review_status"] == "approved" else None
                 for key in ("description", "purpose", "exclusions")
@@ -57,7 +68,7 @@ class HierarchicalCategorySelector:
         self.max_depth = max_depth
 
     def select(
-        self, rows: list[dict], fields: dict, answer: dict, emit: Event
+        self, rows: list[dict], fields: dict, answer: dict, emit: Event, anchor: dict | None = None
     ) -> CategorySelection:
         """Выбирает потомка или текущий узел; допускает один возврат к родителю."""
         output = CategorySelection(strategy="hierarchical", evidence={"hierarchical_steps": []})
@@ -84,7 +95,7 @@ class HierarchicalCategorySelector:
                 )
         for siblings in children.values():
             siblings.sort(key=lambda row: (row["name"].casefold(), row["category_id"]))
-        current = None
+        current = anchor
         stack = []
         excluded = set()
         backtracked = False
@@ -93,6 +104,7 @@ class HierarchicalCategorySelector:
                 child
                 for child in children[current["category_id"] if current else None]
                 if child["category_id"] not in excluded
+                and not approved_category_exclusion(fields["name"], child)
             ]
             if not options and not (current and current["is_assignable"]):
                 output.reason = "На уровне нет доступных категорий"
@@ -177,34 +189,106 @@ class CategoryClassifier:
         self.hierarchy = HierarchicalCategorySelector(inference, depth)
 
     def select(self, fields, answer, emit: Event, strategy="combined") -> CategorySelection:
-        """Сравниваемые стратегии используют одинаковые контракты валидации."""
-        result = self.select_strategy(fields, answer, emit, strategy)
-        if result.category:
-            conflict = category_purpose_conflict(fields["name"], result.category["path_names"])
-            if conflict:
-                result.evidence["purpose_conflict"] = {
-                    "rejected_category": result.category,
-                    "reason": conflict,
-                }
-                result.category = None
-                result.selection_type = "none"
-                result.reason = conflict
-                result.unresolved = True
-        return result
-
-    def select_strategy(self, fields, answer, emit: Event, strategy: str) -> CategorySelection:
-        """Выбирает исходного кандидата по одной стратегии до проверки назначения."""
+        """Проверяет гибридный результат до перехода к обходу или уточнению родителя."""
         if strategy == "hierarchical":
-            return self.run_hierarchy(fields, answer, emit)
+            return self.verify_hierarchy(self.run_hierarchy(fields, answer, emit), fields, answer)
         hybrid = self.hybrid(answer, emit)
-        if hybrid.category is not None or strategy == "hybrid":
+        self.check_exclusions(hybrid, fields)
+        if strategy == "hybrid":
             return hybrid
-        fallback = self.run_hierarchy(fields, answer, emit)
+        if hybrid.category is not None:
+            return self.refine_broader(hybrid, fields, answer, emit)
+        fallback = self.verify_hierarchy(self.run_hierarchy(fields, answer, emit), fields, answer)
         fallback.evidence = {
             "hybrid": {"reason": hybrid.reason, "candidates": hybrid.candidates, **hybrid.evidence},
             **fallback.evidence,
         }
         return fallback
+
+    def check_exclusions(self, result: CategorySelection, fields: dict) -> None:
+        """Отклоняет выбранный UUID по утверждённому исключению из SQL."""
+        if result.category and (
+            phrase := approved_category_exclusion(fields["name"], result.category)
+        ):
+            self.reject_selection(result, f"Утверждённое исключение категории: {phrase}")
+
+    def reject_selection(self, result: CategorySelection, reason: str) -> None:
+        """Сохраняет отклонённый вариант для объяснения fallback."""
+        result.evidence["purpose_conflict"] = {
+            "rejected_category": result.category,
+            "reason": reason,
+        }
+        result.category = None
+        result.selection_type = "none"
+        result.reason = reason
+        result.unresolved = True
+
+    def refine_broader(self, hybrid, fields, answer, emit: Event) -> CategorySelection:
+        """Даёт модели выбрать из непосредственных потомков широкого назначения."""
+        if hybrid.selection_type != "broader":
+            return hybrid
+        _, rows = self.store.index_snapshot()
+        anchor = hybrid.category
+        if not any(
+            str(row["parent_id"]) == anchor["category_id"]
+            and row["is_active"]
+            and row["review_status"] != "deprecated"
+            for row in rows
+        ):
+            return hybrid
+        emit(
+            "classification.refine",
+            "Проверяю подкатегории широкого выбора",
+            {"path": anchor["path_names"]},
+        )
+        refinement = self.hierarchy.select(rows, fields, answer, emit, anchor)
+        if refinement.category and refinement.category["category_id"] != anchor["category_id"]:
+            self.verify_hierarchy(refinement, fields, answer)
+            if refinement.category:
+                refinement.evidence["hybrid"] = {"candidates": hybrid.candidates, **hybrid.evidence}
+                return refinement
+        hybrid.evidence["broader_refinement"] = {"reason": refinement.reason, **refinement.evidence}
+        return hybrid
+
+    def verify_hierarchy(self, result, fields, answer) -> CategorySelection:
+        """Проверяет смысл выбранного пути через существующий answer_2 по исходному изделию."""
+        self.check_exclusions(result, fields)
+        if result.category is None:
+            return result
+        if not self.has_scope_evidence(fields["name"], answer, result.category):
+            self.reject_selection(result, "Исходные сведения не подтверждают назначение ветки")
+            return result
+        try:
+            check = self.inference.answer(
+                2,
+                {
+                    "answer_1_json": {**answer, "source_product_name": fields["name"]},
+                    "category_candidates_json": [result.category],
+                },
+            )
+        except (InvalidModelOutput, DependencyUnavailable) as error:
+            self.reject_selection(result, str(error))
+            result.technical_failure = True
+            result.evidence["semantic_check_issues"] = getattr(error, "attempts", [])
+            return result
+        reply = check["answer_json"]
+        result.evidence["semantic_check"] = reply
+        result.evidence["semantic_check_issues"] = check.get("attempts", [])
+        if reply["status"] != "selected" or reply["category_id"] != result.category["category_id"]:
+            self.reject_selection(result, reply["reason"])
+        return result
+
+    def has_scope_evidence(self, name: str, answer: dict, category: dict) -> bool:
+        """Останавливает догадку о назначении, когда ни изделие, ни ветка не описывают его."""
+        if answer.get("purpose") or answer.get("applications"):
+            return True
+        if category.get("description") or category.get("purpose"):
+            return True
+        branch = " ".join([*category["path_names"], *category.get("aliases", [])])
+        # Сравниваем начала слов, чтобы простое склонение не скрывало связь.
+        words = {word[:4] for word in re.findall(r"[^\W\d_]{4,}", name.casefold())}
+        branch_words = {word[:4] for word in re.findall(r"[^\W\d_]{4,}", branch.casefold())}
+        return bool(words & branch_words)
 
     def run_hierarchy(self, fields, answer, emit: Event) -> CategorySelection:
         """Снимает согласованный SQL-снимок перед сетевыми вызовами."""

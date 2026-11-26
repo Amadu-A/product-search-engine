@@ -145,8 +145,10 @@ docker compose --env-file .env.example --env-file .env run --rm --no-deps app im
 Для ранее завершённого задания `reclassify --job-id UUID` покажет число строк
 к повторной классификации, а `reclassify --job-id UUID --apply` поставит их в очередь.
 Команда работает с сохранёнными данными задания, даже если файл загрузки истёк.
+Она также создаёт недостающие Product для старых назначений с категорией.
 Проверка A/B/C на aistation: `bash scripts/test.sh --classification-live`.
 [Реализация и проверки 02.4](docs/reports/stage-02-4.md).
+[Исправления после ревью 75e1198](docs/reports/stage-02-4-review.md).
 
 [Операции, транзакции и восстановление](docs/import.md) ·
 [ТЗ](docs/technical-assignment.md) · [Матрица тестов](docs/test-matrix.md) ·

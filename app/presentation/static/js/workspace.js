@@ -1,6 +1,6 @@
 // app/presentation/static/js/workspace.js
 // Рабочее место: реальные загрузки, durable progress, ручные решения и SQL-категории.
-import {api, element} from './api.js';
+import {api, element, uploadFiles} from './api.js';
 import {connectEvents} from './events.js';
 
 const $ = selector => document.querySelector(selector);
@@ -135,7 +135,11 @@ async function refresh() {
   $('#progress').value = job.total_count ? job.processed_count / job.total_count * 100 : 0;
   $('#progress-label').textContent = `Обработано ${job.processed_count} / ${job.total_count}`;
   $('#job-status').textContent = labels[job.status] || job.status;
-  $('#assigned-count').textContent = job.auto_assigned_count + job.manual_assigned_count;
+  $('#assigned-count').textContent = job.assigned_count;
+  $('#products-created-count').textContent = job.products_created_count;
+  $('#categorized-products-count').textContent = job.categorized_products_count;
+  $('#assigned-without-product-count').textContent = job.assigned_without_product_count;
+  $('#incomplete-assignment').hidden = !job.assigned_without_product_count;
   $('#auto-assigned-count').textContent = job.auto_assigned_count;
   $('#manual-assigned-count').textContent = job.manual_assigned_count;
   $('#not-product-count').textContent = job.not_product_count;
@@ -212,17 +216,114 @@ async function history() {
   });
 }
 
+const uploadForm = $('#upload-form');
+const maxFiles = Number(uploadForm.dataset.maxFiles);
+const maxBytes = Number(uploadForm.dataset.maxBytes);
+const formats = new Set($('#files').accept.split(','));
+let selectedFiles = [];
+let uploadBusy = false;
+let uploadError = '';
+
+function fileSize(bytes) {
+  return bytes < 1024 ? `${bytes} Б` :
+    bytes < 1024 ** 2 ? `${(bytes / 1024).toFixed(1)} КиБ` : `${(bytes / 1024 ** 2).toFixed(1)} МиБ`;
+}
+
+$('#upload-limits').append(document.createTextNode(` До ${fileSize(maxBytes)} на файл.`));
+
+function fileProblem(file) {
+  const dot = file.name.lastIndexOf('.');
+  if (dot < 0 || !formats.has(file.name.slice(dot).toLowerCase())) return 'Формат не поддерживается';
+  if (!file.size) return 'Файл пуст';
+  return file.size > maxBytes ? `Превышен лимит ${fileSize(maxBytes)}` : '';
+}
+
+function renderSelectedFiles() {
+  const list = $('#selected-files');
+  list.replaceChildren();
+  selectedFiles.forEach((file, index) => {
+    const row = element('li', undefined, 'upload__file');
+    const description = element('div');
+    const problem = fileProblem(file);
+    const status = problem || (uploadBusy ? 'Отправляется' : uploadError ? 'Проверка не завершена' : 'Готов к загрузке');
+    description.append(element('strong', file.name), element('p', `${fileSize(file.size)} · ${status}`, problem ? 'issue' : 'muted'));
+    const remove = element('button', 'Удалить');
+    remove.type = 'button';
+    remove.disabled = uploadBusy;
+    remove.setAttribute('aria-label', `Удалить ${file.name}`);
+    remove.addEventListener('click', () => {
+      selectedFiles.splice(index, 1);
+      uploadError = '';
+      renderSelectedFiles();
+    });
+    row.append(description, remove);
+    list.append(row);
+  });
+  const tooMany = selectedFiles.length > maxFiles;
+  if (!uploadBusy) {
+    $('#upload-status').textContent = uploadError ||
+      (tooMany ? `Можно выбрать до ${maxFiles} файлов. Удалите лишние.` : '');
+  }
+  $('#choose-files').disabled = uploadBusy;
+  $('#upload-button').disabled = uploadBusy || !selectedFiles.length || tooMany || selectedFiles.some(fileProblem);
+  $('#upload-button').textContent = `Загрузить и проверить (${selectedFiles.length})`;
+}
+
+function selectFiles(files) {
+  if (uploadBusy || !files.length) return;
+  selectedFiles.push(...files);
+  uploadError = '';
+  renderSelectedFiles();
+}
+
+listen('#choose-files', 'click', () => $('#files').click());
+listen('#files', 'change', event => {
+  selectFiles(event.target.files);
+  event.target.value = '';
+});
+for (const name of ['dragover', 'dragleave', 'drop']) {
+  $('#drop-zone').addEventListener(name, event => {
+    event.preventDefault();
+    $('#drop-zone').classList.toggle('upload__drop--active', name === 'dragover' && !uploadBusy);
+    if (name === 'drop' && event.dataTransfer) selectFiles(event.dataTransfer.files);
+  });
+}
+
 listen('#upload-form', 'submit', async event => {
-  event.preventDefault(); $('#upload-button').disabled = true;
+  event.preventDefault();
+  if ($('#upload-button').disabled) return;
+  uploadBusy = true;
+  uploadError = '';
+  renderSelectedFiles();
+  const progress = $('#upload-progress');
+  progress.hidden = false;
+  progress.removeAttribute('value');
+  $('#upload-status').textContent = 'Передача файлов…';
+  let preview;
   try {
-    const form = new FormData(); for (const file of $('#files').files) form.append('files', file);
+    const form = new FormData();
+    for (const file of selectedFiles) form.append('files', file);
     const delimiter = $('#delimiter').value;
     form.append('options', JSON.stringify({encoding:$('#encoding').value,header_row:Number($('#header-row').value),...($('#source-name').value ? {source:$('#source-name').value} : {}),...(delimiter ? {delimiter:delimiter === 'tab' ? '\t' : delimiter} : {})}));
-    const preview = await api('/import-jobs', {method:'POST',body:form});
-    await selectJob(preview.job.id);
-    if (preview.can_start && $('#auto-start').checked) await start();
-    else notice('Проверьте preview и подтвердите сопоставление полей');
-  } finally { $('#upload-button').disabled = false; }
+    preview = await uploadFiles(form, percent => {
+      if (percent === null) progress.removeAttribute('value');
+      else progress.value = percent;
+      $('#upload-status').textContent = percent === 100 ? 'Сервер проверяет файлы…' :
+        percent === null ? 'Передача файлов…' : `Передача файлов: ${percent}%`;
+    });
+    selectedFiles = [];
+  } catch (error) {
+    uploadError = error.message;
+    return;
+  } finally {
+    uploadBusy = false;
+    progress.hidden = true;
+    renderSelectedFiles();
+  }
+  await selectJob(preview.job.id);
+  $('#upload-status').textContent = 'Файлы проверены';
+  if (preview.can_start && $('#auto-start').checked) await start();
+  else notice('Проверьте preview и подтвердите сопоставление полей');
 });
 async function start() { await api(`/import-jobs/${state.job}/start`, {method:'POST'}); mobileTab('processing'); await refresh(); notice('Импорт поставлен в очередь'); }
 listen('#start-button','click',start);
@@ -275,7 +376,6 @@ listen('#category-form','submit',async event => {
   await categories(); $('#assign-button').disabled = !state.selected; notice('Категория создана. Индекс: sync_pending');
 });
 listen('#reindex-button','click',async () => { await api('/taxonomy/reindex',{method:'POST'}); notice('Запрошена синхронизация индекса'); });
-for (const event of ['dragover','dragleave','drop']) $('#drop-zone').addEventListener(event,e => { e.preventDefault(); $('#drop-zone').classList.toggle('upload__drop--active',event === 'dragover'); if (event === 'drop') $('#files').files = e.dataTransfer.files; });
 async function indexStatus() { const result = await api('/taxonomy/index-status'); $('#index-status').textContent = `Qdrant: ${result.status} · очередь ${result.pending_events}`; }
 await categories().catch(fail);
 await indexStatus().catch(fail);

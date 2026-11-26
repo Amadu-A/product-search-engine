@@ -68,6 +68,11 @@ class CatalogStore:
             row["depth"] = len(path) - 1
             row["aliases"] = sorted(a["alias"] for a in aliases if a["category_id"] == row["id"])
             row["ancestors_active"] = all(p["is_active"] for p in path)
+            row["ancestor_exclusions"] = [
+                p["semantic_exclusions"]
+                for p in path[:-1]
+                if p["review_status"] == "approved" and p["semantic_exclusions"]
+            ]
         return rows
 
     def lexical_categories(self, tokens: set[str], limit: int = 20) -> list[str]:
@@ -328,7 +333,7 @@ class CatalogSession:
         return counts
 
     def reclassification_items(self, job_id) -> list[dict]:
-        """Выбирает незакрытые решения, исключая утверждённые вручную записи."""
+        """Выбирает незакрытые решения и старые назначения без Product."""
         items, decisions = (self.table(n) for n in ("ingest_job_items", "classification_decisions"))
         related = decisions.c.normalized_record_id == items.c.normalized_record_id
         manual = sa.exists().where(
@@ -338,8 +343,10 @@ class CatalogSession:
         query = sa.select(items).where(
             items.c.job_id == UUID(str(job_id)),
             items.c.normalized_record_id.is_not(None),
-            ~manual,
-            sa.or_(items.c.status.in_(["needs_review", "taxonomy_gap"]), proposed),
+            sa.or_(
+                (items.c.status == "assigned") & items.c.product_id.is_(None),
+                ~manual & sa.or_(items.c.status.in_(["needs_review", "taxonomy_gap"]), proposed),
+            ),
         )
         return [dict(row) for row in self.connection.execute(query).mappings()]
 
@@ -355,33 +362,51 @@ class CatalogSession:
 
     def assignment_counts(self, job_id) -> dict[str, int]:
         """Считает ручные, автоматические и исключённые строки без изменения схемы."""
-        items = self.table("ingest_job_items")
+        items, products = (self.table(n) for n in ("ingest_job_items", "products"))
         manual = self.manual_category_exists(items)
         assigned = items.c.status == "assigned"
-        query = sa.select(
-            sa.func.count().filter(assigned & ~manual).label("auto_assigned_count"),
-            sa.func.count().filter(assigned & manual).label("manual_assigned_count"),
-            sa.func.count().filter(items.c.status == "not_product").label("not_product_count"),
-            sa.func.count()
-            .filter(
-                sa.or_(
-                    items.c.status.in_(["error", "invalid_record"]),
-                    (items.c.status == "needs_review")
-                    & sa.or_(
-                        *[
-                            items.c.issue_codes.contains([code])
-                            for code in (
-                                "classification_technical",
-                                "invalid_output",
-                                "inference_unavailable",
-                            )
-                        ]
-                    ),
+        query = (
+            sa.select(
+                sa.func.count().filter(assigned & ~manual).label("auto_assigned_count"),
+                sa.func.count().filter(assigned & manual).label("manual_assigned_count"),
+                sa.func.count()
+                .filter(assigned & items.c.product_id.is_(None))
+                .label("assigned_without_product_count"),
+                sa.func.count(sa.distinct(products.c.id))
+                .filter(products.c.category_id.is_not(None))
+                .label("categorized_products_count"),
+                sa.func.count().filter(items.c.status == "not_product").label("not_product_count"),
+                sa.func.count()
+                .filter(
+                    sa.or_(
+                        items.c.status.in_(["error", "invalid_record"]),
+                        (items.c.status == "needs_review")
+                        & sa.or_(
+                            *[
+                                items.c.issue_codes.contains([code])
+                                for code in (
+                                    "classification_technical",
+                                    "invalid_output",
+                                    "inference_unavailable",
+                                )
+                            ]
+                        ),
+                    )
                 )
+                .label("technical_error_count"),
             )
-            .label("technical_error_count"),
-        ).where(items.c.job_id == UUID(str(job_id)))
-        return dict(self.connection.execute(query).mappings().one())
+            .select_from(items.outerjoin(products, items.c.product_id == products.c.id))
+            .where(items.c.job_id == UUID(str(job_id)))
+        )
+        created = self.connection.scalar(
+            sa.select(sa.func.count())
+            .select_from(products)
+            .where(products.c.attributes["created_in_job_id"].astext == str(job_id))
+        )
+        return {
+            **self.connection.execute(query).mappings().one(),
+            "products_created_count": created,
+        }
 
     def item_details(self, item_id) -> dict:
         """Собирает trace raw → normalized → understanding → matching → classification."""
@@ -501,10 +526,17 @@ class CatalogSession:
             "source_runs",
             "ingest_jobs",
         )
-        return {
+        counts = {
             name: self.connection.scalar(sa.select(sa.func.count()).select_from(self.table(name)))
             for name in names
         }
+        products = self.table("products")
+        counts["products_with_category"] = self.connection.scalar(
+            sa.select(sa.func.count())
+            .select_from(products)
+            .where(products.c.category_id.is_not(None))
+        )
+        return counts
 
     def duplicate_key_groups(self) -> dict[str, int]:
         """Считает SQL-группы технических дублей; семантическое равенство Product не угадывает."""
@@ -581,6 +613,11 @@ class CatalogSession:
             **path[0],
             "path_ids": [str(row["id"]) for row in reversed(path)],
             "path_names": [row["name"] for row in reversed(path)],
+            "ancestor_exclusions": [
+                row["semantic_exclusions"]
+                for row in path[1:]
+                if row["review_status"] == "approved" and row["semantic_exclusions"]
+            ],
         }
 
     def has_manual_product_category(self, product: dict) -> bool:
@@ -596,7 +633,7 @@ class CatalogSession:
         )
         return bool(self.connection.scalar(query))
 
-    def assign_record_items(self, record_id, category_id) -> set:
+    def assign_record_items(self, record_id, category_id, product_id) -> set:
         """Обновляет все представления одной записи и инвалидирует старые expected_version."""
         jobs = set()
         for item in self.all("ingest_job_items", normalized_record_id=record_id):
@@ -604,11 +641,26 @@ class CatalogSession:
                 "ingest_job_items",
                 item["id"],
                 category_id=category_id,
+                product_id=product_id,
                 status="assigned",
                 processing_version=item["processing_version"] + 1,
             )
             jobs.add(item["job_id"])
         return jobs
+
+    def link_assigned_items(self, record_id, category_id, product_id, old_product_id=None) -> None:
+        """Заполняет отсутствующую или отклонённую связь у строк той же категории."""
+        items = self.table("ingest_job_items")
+        self.connection.execute(
+            items.update()
+            .where(
+                items.c.normalized_record_id == record_id,
+                items.c.category_id == category_id,
+                items.c.status == "assigned",
+                items.c.product_id == old_product_id,
+            )
+            .values(product_id=product_id, processing_version=items.c.processing_version + 1)
+        )
 
     def confirmed_product(self, fields: dict) -> dict | None:
         """Совпадение MPN допустимо только с подтверждённым issuer, без конфликтов вариантов."""

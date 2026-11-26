@@ -26,6 +26,7 @@ from app.domain.catalog import (
     DependencyUnavailable,
     InputRow,
     InvalidModelOutput,
+    approved_category_exclusion,
     evidence_bundle,
     fingerprint,
     is_bare_identifier,
@@ -545,6 +546,9 @@ class CatalogImport:
                     )
                 unit.freeze_taxonomy()
                 category = unit.assignable_path(decision["category_id"])
+                if category:
+                    linked_product = self.ensure_assignment_product(unit, item, linked_product)
+                    self.link_saved_assignment(unit, item, decision, linked_product)
                 self.finish_item(
                     unit,
                     item,
@@ -637,18 +641,7 @@ class CatalogImport:
             if product is None and previous:
                 product = unit.get("products", previous[-1]["product_id"])
             if product is None:
-                product = unit.add(
-                    "products",
-                    canonical_name=fields["name"],
-                    product_type=answer["product_type"],
-                    mpn=fields["mpn"],
-                    normalized_mpn=normalized_key(fields["mpn"]) or None,
-                    unit_code=fields["unit"],
-                    attributes={
-                        "identity_fields": {k: fields[k] for k in ("unit", "quantity")},
-                        "understanding": answer,
-                    },
-                )
+                product = self.create_provisional(unit, item, fields, answer)
             unit.add(
                 "product_match_decisions",
                 normalized_record_id=norm["id"],
@@ -811,6 +804,18 @@ class CatalogImport:
                 result.reason = "Категория изменилась после выбора VLM"
                 result.unresolved = True
                 row = None
+            if row and approved_category_exclusion(
+                fields["name"],
+                {
+                    "exclusions": row["semantic_exclusions"]
+                    if row["review_status"] == "approved"
+                    else None,
+                    "ancestor_exclusions": row["ancestor_exclusions"],
+                },
+            ):
+                result.reason = "При записи обнаружено утверждённое исключение категории"
+                result.unresolved = True
+                row = None
             evidence = {
                 **result.evidence,
                 **usage,
@@ -846,15 +851,26 @@ class CatalogImport:
         with self.store.transaction() as unit:
             unit.freeze_taxonomy()
             product = unit.get("products", product_id, lock=True) if product_id else None
-            for decision in unit.all("classification_decisions", normalized_record_id=norm["id"]):
+            decisions = unit.all("classification_decisions", normalized_record_id=norm["id"])
+            for decision in sorted(decisions, key=lambda row: row["created_at"], reverse=True):
                 if (
                     decision["status"] == "approved"
                     and decision["category_id"]
-                    and decision["product_id"] == product_id
+                    and (product_id is None or decision["product_id"] in {None, product_id})
                     and (not product or product["category_id"] == decision["category_id"])
                     and unit.assignable_path(decision["category_id"])
                 ):
-                    self.finish_item(unit, item, "assigned", decision["category_id"], product_id)
+                    product_id = self.ensure_assignment_product(
+                        unit, item, product_id, decision["evidence"].get("answer_1")
+                    )
+                    linked = self.link_saved_assignment(unit, item, decision, product_id)
+                    self.finish_item(
+                        unit,
+                        item,
+                        "assigned" if linked else "needs_review",
+                        decision["category_id"] if linked else None,
+                        product_id,
+                    )
                     return True
             if product and product["category_id"] and unit.assignable_path(product["category_id"]):
                 self.save_assignment(
@@ -871,13 +887,99 @@ class CatalogImport:
                     level="warning",
                 )
                 return True
-            hint = unit.approved_category_hint(item["raw_record_id"], fields, answer)
-            if hint and unit.assignable_path(hint[0]):
+            if (
+                "reclassify_requested" in item["issue_codes"]
+                and item["product_id"] is None
+                and item["category_id"]
+                and unit.assignable_path(item["category_id"])
+            ):
                 self.save_assignment(
-                    unit, item, hint[0], product_id, hint[1], evidence={"approved_sql_hint": True}
+                    unit, item, item["category_id"], product_id, "existing_product"
+                )
+                return True
+            hint = unit.approved_category_hint(item["raw_record_id"], fields, answer)
+            explicit_type = (
+                answer
+                if answer.get("record_kind") == "product_candidate"
+                else raw_type_understanding(fields)
+            )
+            if hint and (product_id or explicit_type) and unit.assignable_path(hint[0]):
+                self.save_assignment(
+                    unit,
+                    item,
+                    hint[0],
+                    product_id,
+                    hint[1],
+                    evidence={"approved_sql_hint": True, "answer_1": explicit_type},
                 )
                 return True
         return False
+
+    def create_provisional(
+        self, unit, item: dict, fields: dict, answer: dict | None = None
+    ) -> dict:
+        """Создаёт самостоятельный Product и сохраняет задание создания для отчёта."""
+        if not fields.get("name"):
+            raise CatalogError("Для создания Product нужно исходное наименование изделия")
+        return unit.add(
+            "products",
+            canonical_name=fields["name"],
+            product_type=answer.get("product_type") if answer else None,
+            mpn=fields.get("mpn"),
+            normalized_mpn=normalized_key(fields.get("mpn")) or None,
+            unit_code=fields.get("unit"),
+            attributes={
+                "identity_fields": {k: fields.get(k) for k in ("unit", "quantity")},
+                "understanding": answer,
+                "created_in_job_id": str(item["job_id"]),
+            },
+        )
+
+    def ensure_assignment_product(self, unit, item, product_id, answer=None):
+        """Переиспользует связь той же нормализованной записи или создаёт свой Product."""
+        if product_id:
+            return product_id
+        normalized_id = item["normalized_record_id"]
+        matches = unit.all("product_match_decisions", normalized_record_id=normalized_id)
+        newest = sorted(matches, key=lambda match: match["created_at"], reverse=True)
+        manual = {}
+        for match in newest:
+            if match["stage"] == "manual":
+                manual.setdefault(match["product_id"], match["status"])
+        for match in newest:
+            candidate = match["product_id"]
+            if (
+                candidate
+                and manual.get(candidate) != "rejected"
+                and match["status"] in {"candidate", "confirmed"}
+                and unit.get("products", candidate)["status"] != "retired"
+            ):
+                return candidate
+        norm = unit.get("normalized_records", normalized_id)
+        product = self.create_provisional(unit, item, norm["attributes"]["fields"], answer)
+        unit.add(
+            "product_match_decisions",
+            normalized_record_id=normalized_id,
+            product_id=product["id"],
+            stage="after_understanding",
+            method="new_provisional_no_identity_merge",
+            status="candidate",
+            evidence={"origin": "category_assignment"},
+        )
+        return product["id"]
+
+    def link_saved_assignment(self, unit, item, decision, product_id) -> bool:
+        """Связывает проверенное назначение с Product, сохраняя автора и исходный UUID."""
+        category_id = decision["category_id"]
+        product = unit.get("products", product_id, lock=True)
+        if product["category_id"] != category_id:
+            if decision["method"] != "manual" and unit.has_manual_product_category(product):
+                return False
+            unit.update("products", product_id, category_id=category_id)
+        if decision["product_id"] != product_id:
+            unit.update("classification_decisions", decision["id"], product_id=product_id)
+        unit.link_assigned_items(item["normalized_record_id"], category_id, product_id)
+        return True
 
     def save_assignment(
         self,
@@ -892,6 +994,21 @@ class CatalogImport:
     ) -> None:
         """Атомарно назначает категорию, завершает старые предложения и открытые задачи."""
         normalized_id = item["normalized_record_id"]
+        product_id = self.ensure_assignment_product(
+            unit, item, product_id, (evidence or {}).get("answer_1")
+        )
+        product = unit.get("products", product_id, lock=True)
+        if product["category_id"] and unit.has_manual_product_category(product):
+            if not unit.assignable_path(product["category_id"]):
+                self.finish_item(unit, item, "needs_review", product_id=product_id)
+                return
+            if product["category_id"] != category_id:
+                category_id, method, selection_type = (
+                    product["category_id"],
+                    "existing_product",
+                    "exact",
+                )
+                evidence, provenance = {}, {}
         for previous in unit.all("classification_decisions", normalized_record_id=normalized_id):
             if previous["status"] in {"approved", "proposed"} and previous["method"] != "manual":
                 unit.update("classification_decisions", previous["id"], status="superseded")
@@ -907,8 +1024,8 @@ class CatalogImport:
             evidence=evidence or {},
             **(provenance or {}),
         )
-        if product_id:
-            unit.update("products", product_id, category_id=category_id)
+        unit.update("products", product_id, category_id=category_id)
+        unit.link_assigned_items(normalized_id, category_id, product_id)
         for task in unit.all("review_tasks", normalized_record_id=normalized_id, status="open"):
             if task["kind"] in {"category_selection", "taxonomy_gap"}:
                 unit.update(
@@ -991,6 +1108,8 @@ class CatalogImport:
 
     def finish_item(self, unit, item: dict, status: str, category_id=None, product_id=None) -> None:
         """Коммитит результат позиции и event вместе со счётчиками."""
+        if status == "assigned" and (product_id is None or category_id is None):
+            raise CatalogError("Назначение требует Product и категорию")
         issue_codes = set(item["issue_codes"]) - {"reclassify_requested"}
         if status == "assigned":
             issue_codes -= {
@@ -1134,13 +1253,14 @@ class CatalogImport:
     def job(self, job_id) -> dict:
         """Возвращает status и реальные durable counters."""
         with self.store.transaction() as unit:
-            return json_value(
-                {
-                    **unit.get("ingest_jobs", job_id),
-                    **unit.assignment_counts(job_id),
-                    "mode": self.inference.mode,
-                }
-            )
+            return json_value({**self.job_summary(unit, job_id), "mode": self.inference.mode})
+
+    def job_summary(self, unit, job_id) -> dict:
+        """Помечает старый импорт с незаполненным каталогом как завершённый с замечаниями."""
+        job = {**unit.get("ingest_jobs", job_id), **unit.assignment_counts(job_id)}
+        if job["status"] == "completed" and job["assigned_without_product_count"]:
+            job["status"] = "completed_with_issues"
+        return job
 
     def items(self, job_id, status: str | None, query: str, offset: int, limit: int) -> dict:
         """Делегирует SQL pagination без загрузки raw payload всех позиций в браузер."""
@@ -1151,7 +1271,7 @@ class CatalogImport:
     def report(self, job_id) -> dict:
         """Отчёт отражает фактические counters, issues и provenance без секретов."""
         with self.store.transaction() as unit:
-            job = {**unit.get("ingest_jobs", job_id), **unit.assignment_counts(job_id)}
+            job = self.job_summary(unit, job_id)
             rows = unit.items_page(job_id, None, "", 0, self.settings.upload_max_rows)["items"]
             files = unit.all("ingest_job_files", job_id=job["id"])
             norm_ids = list({r["normalized_record_id"] for r in rows if r["normalized_record_id"]})
@@ -1313,6 +1433,7 @@ class CatalogImport:
                 unit.freeze_taxonomy()
                 if not unit.assignable_path(category_id):
                     raise CatalogError("Категория недоступна для назначения")
+                product_id = self.ensure_assignment_product(unit, item, item["product_id"])
                 for decision in unit.all(
                     "classification_decisions", normalized_record_id=item["normalized_record_id"]
                 ):
@@ -1321,7 +1442,7 @@ class CatalogImport:
                 unit.add(
                     "classification_decisions",
                     normalized_record_id=item["normalized_record_id"],
-                    product_id=item["product_id"],
+                    product_id=product_id,
                     category_id=category_id,
                     method="manual",
                     selection_type="exact",
@@ -1329,11 +1450,13 @@ class CatalogImport:
                     evidence={"reason": values["reason"]},
                     decided_by=actor,
                 )
-                affected_jobs = unit.assign_record_items(item["normalized_record_id"], category_id)
+                affected_jobs = unit.assign_record_items(
+                    item["normalized_record_id"], category_id, product_id
+                )
                 for affected_job in affected_jobs:
                     unit.refresh_counts(affected_job)
-                if item["product_id"]:
-                    unit.update("products", item["product_id"], category_id=category_id)
+                unit.update("products", product_id, category_id=category_id)
+                unit.attach_offer(item["raw_record_id"], product_id)
                 for gap in unit.all(
                     "taxonomy_gaps",
                     normalized_record_id=item["normalized_record_id"],
@@ -1418,6 +1541,26 @@ class CatalogImport:
                             identifier["id"],
                             status="confirmed",
                             evidence={"actor": actor, "reason": values["reason"]},
+                        )
+                elif (
+                    item["product_id"] == product_id
+                    and item["status"] == "assigned"
+                    and item["category_id"]
+                ):
+                    unit.freeze_taxonomy()
+                    replacement = self.ensure_assignment_product(unit, item, None)
+                    unit.update("products", replacement, category_id=item["category_id"])
+                    unit.link_assigned_items(
+                        item["normalized_record_id"], item["category_id"], replacement, product_id
+                    )
+                    for decision in unit.all(
+                        "classification_decisions",
+                        normalized_record_id=item["normalized_record_id"],
+                        category_id=item["category_id"],
+                        status="approved",
+                    ):
+                        unit.update(
+                            "classification_decisions", decision["id"], product_id=replacement
                         )
                 else:
                     unit.update(

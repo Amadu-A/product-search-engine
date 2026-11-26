@@ -103,6 +103,8 @@ def test_browser_mapping_sheets_bulk_and_safe_text(browser_workspace, tmp_path):
         expect(page.locator("#assigned-count")).to_have_text("1")
         expect(page.locator("#manual-assigned-count")).to_have_text("1")
         expect(page.locator("#auto-assigned-count")).to_have_text("0")
+        expect(page.locator("#products-created-count")).to_have_text("1")
+        expect(page.locator("#categorized-products-count")).to_have_text("1")
         page.locator("#files").set_input_files(xlsx_path)
         page.locator("#upload-button").click()
         page.wait_for_function(
@@ -159,6 +161,110 @@ def test_browser_mapping_sheets_bulk_and_safe_text(browser_workspace, tmp_path):
         assert page.evaluate("document.documentElement.scrollWidth <= innerWidth + 1")
         Path(".tmp/browser/formats").mkdir(parents=True, exist_ok=True)
         page.screenshot(path=".tmp/browser/formats/mobile.png", full_page=True)
+        assert not errors
+        browser.close()
+
+
+def test_file_chooser_drop_and_multipart_on_http(browser_workspace, tmp_path, monkeypatch):
+    """Проверяет видимый выбор, drop, удаление, ошибки и настоящую передачу файлов."""
+    service, address = browser_workspace
+    monkeypatch.setattr(service.settings, "upload_max_bytes", 512)
+    path = tmp_path / ("очень-длинное-имя-" * 5 + "каталог.json")
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "source": "browser_review",
+                "items": [{"name": "Кабель тестовый"}],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    gate = threading.Event()
+    upload = service.upload
+
+    def wait_for_ui(files, options):
+        """Удерживает реальный запрос для проверки видимого состояния передачи."""
+        if files[0][0] == path.name:
+            assert gate.wait(15)
+        return upload(files, options)
+
+    monkeypatch.setattr(service, "upload", wait_for_ui)
+    errors = []
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(
+            args=[
+                "--no-sandbox",
+                "--host-resolver-rules=MAP pse.test 127.0.0.1",
+                "--no-proxy-server",
+            ]
+        )
+        page = browser.new_page(viewport={"width": 320, "height": 780})
+        page.on("pageerror", lambda error: errors.append(str(error)))
+        page.goto(address.replace("127.0.0.1", "pse.test") + "/admin/import")
+        assert page.evaluate("!isSecureContext")
+        page.locator("#auto-start").uncheck()
+        send = page.locator("#upload-button")
+        expect(send).to_be_disabled()
+        with page.expect_file_chooser() as selection:
+            page.get_by_role("button", name="Выбрать файлы").click()
+        selection.value.set_files(path)
+        expect(page.locator("#selected-files")).to_contain_text(path.name)
+        expect(page.locator("#selected-files")).to_contain_text("Готов к загрузке")
+        expect(send).to_have_text("Загрузить и проверить (1)")
+        assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+        assert page.locator(".header nav").evaluate("(nav) => nav.scrollWidth <= nav.clientWidth")
+        Path(".tmp/browser").mkdir(parents=True, exist_ok=True)
+        page.screenshot(path=".tmp/browser/stage024-upload-mobile.png", full_page=True)
+        page.get_by_role("button", name="Удалить " + path.name).click()
+        expect(send).to_be_disabled()
+
+        drop = page.evaluate_handle("""() => {
+          const data = new DataTransfer();
+          data.items.add(new File(['{}'], 'format.txt'));
+          data.items.add(new File(['x'.repeat(513)], 'large.json'));
+          data.items.add(new File(['{'], 'broken.json', {type: 'application/json'}));
+          return data;
+        }""")
+        page.locator("#drop-zone").dispatch_event("drop", {"dataTransfer": drop})
+        expect(send).to_have_text("Загрузить и проверить (3)")
+        expect(send).to_be_disabled()
+        expect(page.locator("#selected-files")).to_contain_text("Формат не поддерживается")
+        expect(page.locator("#selected-files")).to_contain_text("Превышен лимит")
+        for name in ("format.txt", "large.json"):
+            page.get_by_role("button", name="Удалить " + name).click()
+        send.click()
+        expect(page.locator("#upload-status")).to_contain_text("JSON")
+        expect(page.locator("#selected-files")).to_contain_text("Проверка не завершена")
+        page.get_by_role("button", name="Удалить broken.json").click()
+
+        with page.expect_file_chooser() as selection:
+            page.get_by_role("button", name="Выбрать файлы").click()
+        selection.value.set_files(path)
+        dropped_json = page.evaluate_handle("""() => {
+          const data = new DataTransfer();
+          data.items.add(new File([JSON.stringify({
+            schema_version: 1, source: 'browser_drop', items: [{name: 'Провод тестовый'}],
+          })], 'drop.json', {type: 'application/json'}));
+          return data;
+        }""")
+        page.locator("#drop-zone").dispatch_event("drop", {"dataTransfer": dropped_json})
+        expect(send).to_have_text("Загрузить и проверить (2)")
+        with page.expect_request("**/api/v1/import-jobs") as posted:
+            send.click()
+        try:
+            assert posted.value.method == "POST"
+            assert posted.value.headers["content-type"].startswith("multipart/form-data; boundary=")
+            expect(page.locator("#upload-progress")).to_be_visible()
+            expect(send).to_be_disabled()
+        finally:
+            gate.set()
+        expect(page.locator("#preview-files")).to_contain_text(path.name)
+        expect(page.locator("#preview-files")).to_contain_text("drop.json")
+        expect(page.locator("#upload-status")).to_have_text("Файлы проверены")
+        expect(send).to_be_disabled()
+        assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
         assert not errors
         browser.close()
 

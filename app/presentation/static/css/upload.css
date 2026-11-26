@@ -1,0 +1,52 @@
+/* app/presentation/static/css/upload.css */
+.upload, .panel, .header nav, .mobile-tabs, .toolbar label {
+  min-width: 0;
+}
+
+.upload__files {
+  display: grid;
+  gap: 8px;
+  list-style: none;
+  padding: 0;
+}
+
+.upload__file {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.upload__file p {
+  margin: 4px 0 0;
+}
+
+.upload__progress {
+  width: 100%;
+  accent-color: var(--teal);
+}
+
+.upload__file, #upload-status, #preview-files, .events li, .history-row {
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 760px) {
+  .workspace, .review__panes {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .counters {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .header nav, .mobile-tabs {
+    flex-wrap: wrap;
+  }
+
+  .header nav {
+    flex: 0 0 100%;
+  }
+}

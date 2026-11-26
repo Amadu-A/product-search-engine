@@ -201,21 +201,15 @@ def raw_type_understanding(fields: dict) -> dict | None:
     }
 
 
-def category_purpose_conflict(name: str, path: list[str]) -> str | None:
-    """Отсекает конфликт назначения медицинских лотков с отраслевыми ветками."""
+def approved_category_exclusion(name: str, category: dict) -> str | None:
+    """Проверяет отдельные фразы из утверждённых исключений узла и его предков."""
     source = (normalize_text(name) or "").casefold()
-    branch = (normalize_text(" ".join(path)) or "").casefold()
-    medical = r"\b(?:медицинск|хирургическ|стоматологическ|стерилизац)\w*"
-    is_tray = re.search(r"\b(?:лоток|лотк\w+)\b", source)
-    medical_tray = is_tray and (
-        re.search(medical, source) or re.search(r"\bпочкообразн\w*", source)
-    )
-    specialized_branch = re.search(
-        r"\b(?:электрик|электромонтаж|кабел|маляр|лакокрас|теплотрасс|дренаж|водоотвод)\w*",
-        branch,
-    )
-    if medical_tray and specialized_branch and not re.search(medical, branch):
-        return "Назначение медицинского лотка не соответствует выбранной ветке"
+    rules = [category.get("exclusions"), *category.get("ancestor_exclusions", [])]
+    for rule in filter(None, rules):
+        for line in rule.splitlines():
+            phrase = normalize_text(line.removeprefix("- "))
+            if phrase and re.search(r"(?<!\w)" + re.escape(phrase.casefold()) + r"(?!\w)", source):
+                return phrase
     return None
 
 

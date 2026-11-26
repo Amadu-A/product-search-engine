@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class JobView(BaseModel):
-    """Счётчики означают позиции, а не число подтверждённых Product."""
+    """Разделяет счётчики исходных строк и объектов каталога."""
 
     model_config = ConfigDict(extra="allow")
     id: UUID
@@ -31,6 +31,9 @@ class JobView(BaseModel):
     assigned_count: int
     auto_assigned_count: int = 0
     manual_assigned_count: int = 0
+    assigned_without_product_count: int = 0
+    products_created_count: int = 0
+    categorized_products_count: int = 0
     not_product_count: int = 0
     technical_error_count: int = 0
     needs_review_count: int

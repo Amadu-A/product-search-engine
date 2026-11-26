@@ -17,15 +17,24 @@
 <main class="workspace" id="import-view">
   <nav class="mobile-tabs" aria-label="Панели импорта"><button type="button" data-mobile-tab="file" aria-pressed="true">Файл</button><button type="button" data-mobile-tab="processing" aria-pressed="false">Обработка</button><button type="button" data-mobile-tab="review" aria-pressed="false">На проверке</button><button type="button" data-mobile-tab="categories" aria-pressed="false">Категории</button></nav>
   <aside class="panel upload"><h1>Импорт номенклатуры</h1><p class="muted">Загрузите каталог, проверьте результаты и назначьте категории.</p>
-    <form id="upload-form">
-      <div class="upload__drop" id="drop-zone"><span aria-hidden="true" class="upload__icon">⇧</span><strong>Перетащите файлы сюда</strong><span>или выберите на компьютере</span><label class="button" for="files">Выбрать файлы</label><input id="files" name="files" type="file" accept=".json,.xml,.xlsx,.csv" multiple required></div>
-      <p class="muted">JSON · XML · XLSX · CSV<br>До 50 МиБ на файл, 10 файлов, 100 000 строк.</p>
+    <form id="upload-form" data-max-files="{{ upload_max_files }}" data-max-bytes="{{ upload_max_bytes }}">
+      <div class="upload__drop" id="drop-zone">
+        <span aria-hidden="true" class="upload__icon">⇧</span>
+        <strong>Перетащите файлы сюда</strong>
+        <span>или выберите на компьютере</span>
+        <button type="button" id="choose-files">Выбрать файлы</button>
+        <input id="files" type="file" accept=".json,.xml,.xlsx,.csv" multiple hidden>
+      </div>
+      <p id="upload-limits" class="muted">JSON · XML · XLSX · CSV. До {{ upload_max_files }} файлов и {{ upload_max_rows }} строк.</p>
+      <ul id="selected-files" class="upload__files" aria-label="Выбранные файлы"></ul>
+      <p id="upload-status" class="muted" role="status"></p>
+      <progress id="upload-progress" class="upload__progress" max="100" aria-label="Передача файлов" hidden></progress>
       <a href="/import-formats" target="_blank" rel="noopener">Форматы файлов и примеры ↗</a>
       <p class="muted">Скачать шаблон: <a href="/api/v1/import-templates/json">JSON</a> · <a href="/api/v1/import-templates/xml">XML</a> · <a href="/api/v1/import-templates/xlsx">XLSX</a> · <a href="/api/v1/import-templates/csv">CSV</a></p>
       <details><summary>Параметры CSV / XLSX</summary><label>Кодировка<select id="encoding"><option value="utf-8-sig">UTF-8 / BOM</option><option value="cp1251">Windows-1251 (явно)</option></select></label><label>Разделитель<select id="delimiter"><option value="">Определить</option value=";">;</option><option value=",">,</option><option value="tab">Табуляция</option></select></label><label>Строка заголовков<input id="header-row" type="number" min="1" max="1000" value="1"></label></details>
       <label class="check"><input id="auto-start" type="checkbox" checked> Начать после однозначного preview</label>
       <label>Источник для CSV / XLSX / массива JSON<input id="source-name" maxlength="128" placeholder="По умолчанию: имя файла"></label>
-      <button class="button button--primary" type="submit" id="upload-button">Загрузить и проверить</button>
+      <button class="button button--primary" type="submit" id="upload-button" disabled>Загрузить и проверить (0)</button>
     </form>
     <section id="preview" hidden><h2>Предварительный просмотр</h2><div id="preview-files"></div><details id="mapping-options"><summary>Сопоставление полей</summary><div id="mapping-fields"></div></details><label id="sheet-label" hidden>Листы (через запятую)<input id="sheets"></label><label class="check"><input id="save-profile" type="checkbox"> Сохранить профиль для этих файлов</label><button type="button" id="mapping-button">Подтвердить сопоставление</button><button class="button button--primary" type="button" id="start-button">Начать обработку</button></section>
   </aside>
@@ -34,8 +43,11 @@
       <div class="progress__controls"><span id="job-status">Нет задания</span><button type="button" id="cancel-button" disabled>Остановить</button><button type="button" id="resume-button" disabled>Продолжить</button><a id="report-json" hidden>Отчёт JSON</a><a id="report-csv" hidden>CSV</a></div>
       <div class="toolbar"><label>События<select id="event-filter"><option value="all">Все</option><option value="success">Успешные</option><option value="warning">На проверке</option><option value="error">Ошибки</option></select></label><label>Поиск в ленте<input id="event-search" type="search" placeholder="Имя или record_id"></label></div>
       <ol id="events" class="events" aria-label="События обработки"></ol>
-      <span id="assigned-count" hidden>0</span>
       <div class="counters">
+        <div class="counter counter--ok">Распределено исходных строк<strong id="assigned-count">0</strong></div>
+        <div class="counter">Создано Product<strong id="products-created-count">0</strong></div>
+        <div class="counter">Product с категорией<strong id="categorized-products-count">0</strong></div>
+        <div class="counter counter--gap" id="incomplete-assignment" hidden>Назначено без Product<strong id="assigned-without-product-count">0</strong></div>
         <div class="counter counter--ok">Автоматически<strong id="auto-assigned-count">0</strong></div>
         <div class="counter counter--ok">Вручную<strong id="manual-assigned-count">0</strong></div>
         <div class="counter counter--review">На проверке<strong id="review-count">0</strong></div>

@@ -133,7 +133,14 @@ def create_app(service=None) -> FastAPI:
     def workspace(request: Request):
         """Отдаёт действующее рабочее место с явной маркировкой режима inference."""
         return templates.TemplateResponse(
-            request=request, name="import.html", context={"mode": service.inference.mode}
+            request=request,
+            name="import.html",
+            context={
+                "mode": service.inference.mode,
+                "upload_max_files": service.settings.upload_max_files,
+                "upload_max_bytes": service.settings.upload_max_bytes,
+                "upload_max_rows": service.settings.upload_max_rows,
+            },
         )
 
     @app.get("/health/live")
