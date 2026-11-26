@@ -187,7 +187,10 @@ def test_invalid_answer2_keeps_product_and_raw_output(catalog, tmp_path, monkeyp
     with catalog.store.transaction() as unit:
         decision = unit.all("classification_decisions")[0]
         assert decision["status"] == "needs_review" and decision["category_id"] is None
-        assert decision["evidence"]["raw_response_text"] == '{"invalid":true}'
+        assert (
+            decision["evidence"]["hybrid"]["inference_issues"][0]["raw_response_text"]
+            == '{"invalid":true}'
+        )
         assert unit.all("review_tasks")[0]["status"] == "open"
 
 

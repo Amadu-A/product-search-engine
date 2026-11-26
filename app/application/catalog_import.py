@@ -16,6 +16,7 @@ from app.application.catalog_ports import (
     JobQueue,
     Understanding,
 )
+from app.application.category_selection import CategoryClassifier
 from app.domain.catalog import (
     NORMALIZER_VERSION,
     TERMINAL_ITEMS,
@@ -33,6 +34,7 @@ from app.domain.catalog import (
     normalize_row,
     normalize_text,
     normalized_key,
+    raw_type_understanding,
     supported_candidate,
 )
 
@@ -52,6 +54,7 @@ class CatalogImport:
         """Внедряет порты без создания соединений в domain/application."""
         self.store, self.parser, self.inference = store, parser, inference
         self.index, self.queue, self.settings = index, queue, settings
+        self.classifier = CategoryClassifier(store, index, inference, settings.taxonomy_max_depth)
 
     def upload(
         self,
@@ -410,7 +413,10 @@ class CatalogImport:
                 continue
             try:
                 with self.store.record_lock(current["normalized_record_id"]):
-                    self.process_item(current)
+                    with self.store.transaction() as unit:
+                        current = unit.get("ingest_job_items", item["id"])
+                    if current["status"] not in TERMINAL_ITEMS:
+                        self.process_item(current)
             except (CatalogError, DependencyUnavailable) as error:
                 issue_code = (
                     "invalid_output"
@@ -420,11 +426,16 @@ class CatalogImport:
                     else "taxonomy_changed"
                 )
                 with self.store.transaction() as unit:
+                    fresh = unit.get("ingest_job_items", item["id"], lock=True)
+                    if fresh["processing_version"] != current["processing_version"]:
+                        continue
                     unit.update(
                         "ingest_job_items",
                         item["id"],
                         status="needs_review",
-                        issue_codes=list(set(item["issue_codes"] + [issue_code])),
+                        issue_codes=sorted(
+                            (set(current["issue_codes"]) - {"reclassify_requested"}) | {issue_code}
+                        ),
                     )
                     unit.event(
                         UUID(job_id),
@@ -436,11 +447,17 @@ class CatalogImport:
                     unit.refresh_counts(UUID(job_id))
             except Exception as error:
                 with self.store.transaction() as unit:
+                    fresh = unit.get("ingest_job_items", item["id"], lock=True)
+                    if fresh["processing_version"] != current["processing_version"]:
+                        continue
                     unit.update(
                         "ingest_job_items",
                         item["id"],
                         status="error",
-                        issue_codes=list(set(item["issue_codes"] + ["processing_error"])),
+                        issue_codes=sorted(
+                            (set(current["issue_codes"]) - {"reclassify_requested"})
+                            | {"processing_error"}
+                        ),
                     )
                     unit.event(
                         UUID(job_id),
@@ -465,7 +482,7 @@ class CatalogImport:
             unit.event(
                 job["id"],
                 "job.completed",
-                "Обработка завершена; предложения требуют проверки",
+                "Обработка завершена",
                 data=counts,
             )
 
@@ -490,7 +507,13 @@ class CatalogImport:
             )
 
     def process_item(self, item: dict) -> None:
-        """Fast match → answer_1 cache → matching → retrieval → answer_2 → SQL recheck."""
+        """Ограничивает бюджет VLM для всего конвейера одной позиции."""
+        with self.inference.budget() as usage:
+            self.process_with_budget(item, usage)
+
+    def process_with_budget(self, item: dict, usage: dict) -> None:
+        """Сохраняет независимость установления идентичности и классификации."""
+        reclassify = "reclassify_requested" in item["issue_codes"]
         with self.store.transaction() as unit:
             norm = unit.get("normalized_records", item["normalized_record_id"])
             fields = norm["attributes"]["fields"]
@@ -520,22 +543,25 @@ class CatalogImport:
                         if manual_matches[-1]["status"] == "confirmed"
                         else None
                     )
+                unit.freeze_taxonomy()
+                category = unit.assignable_path(decision["category_id"])
                 self.finish_item(
                     unit,
                     item,
-                    "assigned" if self.valid_category(decision["category_id"]) else "needs_review",
-                    decision["category_id"]
-                    if self.valid_category(decision["category_id"])
-                    else None,
+                    "assigned" if category else "needs_review",
+                    decision["category_id"] if category else None,
                     linked_product,
                 )
                 return
-            product = unit.confirmed_product(fields)
+            if reclassify:
+                product = unit.get("products", item["product_id"]) if item["product_id"] else None
+            else:
+                product = unit.confirmed_product(fields)
             if product and product["id"] in rejected_ids:
                 product = None
             if manual_matches and manual_matches[-1]["status"] == "confirmed":
                 product = unit.get("products", manual_matches[-1]["product_id"])
-            if product:
+            if product and not reclassify:
                 unit.freeze_taxonomy()
                 unit.add(
                     "product_match_decisions",
@@ -546,63 +572,20 @@ class CatalogImport:
                     status="confirmed",
                     evidence={"issuer": fields.get("manufacturer") or fields.get("brand")},
                 )
-                if product["category_id"] and self.valid_category(product["category_id"]):
-                    unit.add(
-                        "classification_decisions",
-                        normalized_record_id=norm["id"],
-                        product_id=product["id"],
-                        category_id=product["category_id"],
-                        method="existing_product",
-                        selection_type="exact",
-                        status="approved",
-                    )
-                    self.finish_item(unit, item, "assigned", product["category_id"], product["id"])
-                    return
+        product_id = product["id"] if product else None
+        if self.assign_existing(item, norm, product_id, fields, {"product_type": fields["name"]}):
+            return
         self.stage(item, "understanding")
-        bundle = evidence_bundle(
-            str(norm["id"]),
-            {"fields": fields},
-            norm["attributes"]["locator"],
-            self.settings.inference_max_input_chars,
-        )
-        values = {"evidence_bundle_json": bundle}
         try:
-            provenance = self.inference.provenance(1, values)
-        except DependencyUnavailable as error:
-            with self.store.transaction() as unit:
-                unit.unique(
-                    "product_understandings",
-                    {
-                        "normalized_record_id": norm["id"],
-                        **self.inference.provenance(1, values, resolve=False),
-                    },
-                    status="unavailable",
-                    raw_response_text=str(error),
-                )
-            raise
-        with self.store.transaction() as unit:
-            cached = unit.all(
-                "product_understandings", normalized_record_id=norm["id"], **provenance
-            )
-        if cached and cached[0]["status"] in {"recognized", "insufficient_evidence"}:
-            answer = cached[0]["answer_json"]
-        else:
-            try:
-                result = self.inference.answer(1, values)
-            except (CatalogError, DependencyUnavailable) as error:
-                with self.store.transaction() as unit:
-                    unit.unique(
-                        "product_understandings",
-                        {"normalized_record_id": norm["id"], **provenance},
-                        status="invalid_output"
-                        if isinstance(error, CatalogError)
-                        else "unavailable",
-                        raw_response_text=getattr(error, "raw_response", str(error)),
-                    )
+            answer = self.understand(item, norm, usage, reclassify)
+        except InvalidModelOutput:
+            answer = raw_type_understanding(fields)
+            if answer is None:
                 raise
-            answer = result["answer_json"]
-            with self.store.transaction() as unit:
-                unit.save_understanding(norm["id"], provenance, result)
+            usage["understanding_origin"] = "raw_name"
+        if reclassify or usage.get("understanding_origin") == "raw_name":
+            self.classify_saved(item, norm, product, answer, usage)
+            return
         if (
             answer["status"] != "recognized"
             or answer["record_kind"] != "product_candidate"
@@ -649,6 +632,8 @@ class CatalogImport:
                 if d["stage"] == "manual" and d["status"] == "rejected"
             }
             previous = [d for d in previous if d["product_id"] not in rejected]
+            if product and product["id"] in rejected:
+                product = None
             if product is None and previous:
                 product = unit.get("products", previous[-1]["product_id"])
             if product is None:
@@ -678,158 +663,350 @@ class CatalogImport:
             )
             unit.update("ingest_job_items", item["id"], product_id=product["id"])
             unit.attach_offer(item["raw_record_id"], product["id"])
-            hint = unit.approved_category_hint(item["raw_record_id"], fields, answer)
-            if hint:
-                unit.freeze_taxonomy()
-                if self.valid_category(hint[0]):
+        self.classify_saved(item, norm, product, answer, usage)
+
+    def understand(self, item: dict, norm: dict, usage: dict, saved: bool = False) -> dict:
+        """Повторно использует валидный answer_1 и хранит технические попытки отдельно."""
+        fields = norm["attributes"]["fields"]
+        bundle = evidence_bundle(
+            str(norm["id"]),
+            {"fields": fields},
+            norm["attributes"]["locator"],
+            self.settings.inference_max_input_chars,
+        )
+        values = {"evidence_bundle_json": bundle}
+        provenance = self.inference.provenance(1, values, resolve=False)
+        with self.store.transaction() as unit:
+            if saved:
+                previous = [
+                    row
+                    for row in unit.all("product_understandings", normalized_record_id=norm["id"])
+                    if row["status"] in {"recognized", "insufficient_evidence"}
+                    and row["answer_json"]
+                    and row["model_revision"].startswith("mock") == (self.inference.mode == "mock")
+                ]
+                if previous:
+                    return max(previous, key=lambda row: row["created_at"])["answer_json"]
+        try:
+            provenance = self.inference.provenance(1, values)
+            with self.store.transaction() as unit:
+                cached = unit.all(
+                    "product_understandings", normalized_record_id=norm["id"], **provenance
+                )
+            if cached and cached[0]["status"] in {"recognized", "insufficient_evidence"}:
+                return cached[0]["answer_json"]
+            result = self.inference.answer(1, values)
+        except (InvalidModelOutput, DependencyUnavailable) as error:
+            usage["answer_1_issues"] = getattr(error, "attempts", [])
+            with self.store.transaction() as unit:
+                unit.unique(
+                    "product_understandings",
+                    {"normalized_record_id": norm["id"], **provenance},
+                    status="invalid_output"
+                    if isinstance(error, InvalidModelOutput)
+                    else "unavailable",
+                    raw_response_text=getattr(error, "raw_response", None),
+                )
+                if usage["answer_1_issues"]:
                     unit.add(
                         "classification_decisions",
                         normalized_record_id=norm["id"],
-                        product_id=product["id"],
-                        category_id=hint[0],
-                        method=hint[1],
-                        selection_type="exact",
-                        status="approved",
-                        evidence={"approved_sql_hint": True},
+                        product_id=item["product_id"],
+                        method="none",
+                        selection_type="none",
+                        status="needs_review",
+                        evidence={
+                            "answer_1_issues": usage["answer_1_issues"],
+                            "mode": self.inference.mode,
+                        },
                     )
-                    unit.update("products", product["id"], category_id=hint[0])
-                    self.finish_item(unit, item, "assigned", hint[0], product["id"])
-                    return
-        self.stage(item, "classifying")
-        candidates, warnings = self.index.candidates(answer)
-        values2 = {"answer_1_json": answer, "category_candidates_json": candidates}
-        provenance2 = self.inference.provenance(2, values2, resolve=False)
+            raise
+        usage["answer_1_issues"] = result.get("attempts", [])
         with self.store.transaction() as unit:
-            previous_selections = [
-                d
-                for d in unit.all("classification_decisions", normalized_record_id=norm["id"])
-                if d["method"] == "retrieval_vlm"
-                and d["prompt_sha256"] == provenance2["prompt_sha256"]
-                and d["model_revision"] == provenance2["model_revision"]
-                and d["evidence"].get("answer_2_input_sha256") == provenance2["input_sha256"]
-                and "answer_2" in d["evidence"]
-            ]
-        cached_selection = (
-            max(previous_selections, key=lambda d: d["created_at"]) if previous_selections else None
-        )
-        try:
-            answer2 = (
-                {**provenance2, "answer_json": cached_selection["evidence"]["answer_2"]}
-                if cached_selection
-                else self.inference.answer(2, values2)
-                if candidates
-                else {
-                    "answer_json": {
-                        "status": "no_suitable_category",
-                        "category_id": None,
-                        "selection_type": "none",
-                        "reason": "Нет разрешённых категорий",
-                        "supporting_evidence_ids": [],
-                        "compared_candidate_ids": [],
-                    },
-                    "prompt_sha256": None,
-                    "model_revision": self.inference.model_revision,
-                }
-            )
-        except (CatalogError, DependencyUnavailable) as error:
-            with self.store.transaction() as unit:
+            unit.save_understanding(norm["id"], provenance, result)
+            if usage["answer_1_issues"]:
+                unit.event(
+                    item["job_id"],
+                    "classification.repaired",
+                    "Ответ о типе изделия исправлен",
+                    item_id=item["id"],
+                    data={"codes": [value["code"] for value in usage["answer_1_issues"]]},
+                )
                 unit.add(
                     "classification_decisions",
                     normalized_record_id=norm["id"],
-                    product_id=product["id"],
-                    method="retrieval_vlm",
+                    product_id=item["product_id"],
+                    method="none",
                     selection_type="none",
-                    status="needs_review",
-                    candidates=candidates,
+                    status="superseded",
                     evidence={
-                        "error": str(error),
-                        "raw_response_text": getattr(error, "raw_response", None),
+                        "answer_1_issues": usage["answer_1_issues"],
                         "mode": self.inference.mode,
                     },
-                    prompt_sha256=provenance2["prompt_sha256"],
-                    model_revision=provenance2["model_revision"],
-                    embedding_model_revision=self.inference.embedding_revision,
-                    taxonomy_revision=unit.taxonomy_revision(),
                 )
-                unit.add(
-                    "review_tasks",
-                    normalized_record_id=norm["id"],
-                    product_id=product["id"],
-                    kind="category_selection",
-                    context={"error": str(error)},
+        return result["answer_json"]
+
+    def classify_saved(
+        self, item: dict, norm: dict, product: dict | None, answer: dict, usage: dict
+    ) -> None:
+        """Выбирает категорию по утверждённым данным или VLM, независимо от Product."""
+        product_id = product["id"] if product else None
+        fields = norm["attributes"]["fields"]
+        if (
+            answer["status"] != "recognized"
+            or answer["record_kind"] != "product_candidate"
+            or not answer["product_type"]
+            or is_bare_identifier(fields)
+        ):
+            with self.store.transaction() as unit:
+                status = (
+                    "not_product"
+                    if answer["record_kind"] in {"category_listing", "other"}
+                    else "needs_review"
                 )
-            raise
-        selected = answer2["answer_json"]
-        category_id = UUID(selected["category_id"]) if selected["category_id"] else None
-        if category_id and not self.valid_category(category_id, candidates):
-            raise CatalogError("Категория изменилась после поиска; требуется повторная проверка")
+                self.finish_item(unit, item, status, product_id=product_id)
+            return
+        if self.assign_existing(item, norm, product_id, fields, answer):
+            return
+        self.stage(item, "classifying")
         with self.store.transaction() as unit:
+            unit.event(
+                item["job_id"],
+                "classification.type",
+                "Определён тип: " + answer["product_type"][:200],
+                item_id=item["id"],
+                data={"origin": usage.get("understanding_origin", "answer_1")},
+            )
+
+        def emit(kind: str, message: str, data: dict) -> None:
+            """Фиксирует переходы без сырого текста модели в SSE."""
+            with self.store.transaction() as unit:
+                unit.event(item["job_id"], kind, message, item_id=item["id"], data=data)
+
+        result = self.classifier.select(fields, answer, emit)
+        with self.store.transaction() as unit:
+            unit.freeze_taxonomy()
             fresh = unit.get("ingest_job_items", item["id"], lock=True)
             if fresh["processing_version"] != item["processing_version"]:
                 return
-            unit.freeze_taxonomy()
-            if category_id and not self.valid_category(category_id, candidates):
-                raise CatalogError("Категория изменилась перед записью решения")
-            if warnings:
-                status = "needs_review"
-            elif category_id:
-                status = "proposed"
-            elif selected["status"] == "no_suitable_category":
-                status = "no_suitable_category"
-            else:
-                status = "needs_review"
-            unit.add(
-                "classification_decisions",
-                normalized_record_id=norm["id"],
-                product_id=product["id"],
-                category_id=category_id if status == "proposed" else None,
-                method="retrieval_vlm",
-                selection_type=selected["selection_type"] if status == "proposed" else "none",
-                status=status,
-                candidates=candidates,
-                evidence={
-                    "answer_1": answer,
-                    "answer_2": selected,
-                    "warnings": warnings,
-                    "mode": self.inference.mode,
-                    "answer_2_input_sha256": provenance2["input_sha256"],
-                },
-                prompt_sha256=answer2["prompt_sha256"],
-                model_revision=answer2["model_revision"],
-                embedding_model_revision=self.inference.embedding_revision,
-                taxonomy_revision=unit.taxonomy_revision(),
-            )
-            if status == "no_suitable_category":
-                unit.add(
-                    "taxonomy_gaps",
-                    normalized_record_id=norm["id"],
-                    product_id=product["id"],
-                    proposed_type=answer["product_type"],
-                    evidence={"answer_1": answer, "answer_2": selected},
+            existing = unit.get("products", product_id, lock=True) if product_id else None
+            if (
+                existing
+                and existing["category_id"]
+                and unit.assignable_path(existing["category_id"])
+            ):
+                self.save_assignment(
+                    unit, item, existing["category_id"], product_id, "existing_product"
                 )
+                return
+            if existing and existing["category_id"] and unit.has_manual_product_category(existing):
+                self.finish_item(unit, item, "needs_review", product_id=product_id)
+                return
+            chosen = result.category
+            row = unit.assignable_path(chosen["category_id"]) if chosen else None
+            if chosen and (
+                not row
+                or any(row[k] != chosen[k] for k in ("path_ids", "path_names", "review_status"))
+            ):
+                result.reason = "Категория изменилась после выбора VLM"
+                result.unresolved = True
+                row = None
+            evidence = {
+                **result.evidence,
+                **usage,
+                "answer_1": answer,
+                "mode": self.inference.mode,
+                "strategy": result.strategy,
+                "reason": result.reason,
+                "model_logical_id": result.provenance.get("model_logical_id"),
+            }
+            provenance = {
+                "prompt_sha256": result.provenance.get("prompt_sha256"),
+                "model_revision": result.provenance.get("model_revision"),
+                "embedding_model_revision": self.inference.embedding_revision,
+                "taxonomy_revision": unit.taxonomy_revision(),
+                "candidates": result.candidates,
+            }
+            if row:
+                self.save_assignment(
+                    unit,
+                    item,
+                    row["id"],
+                    product_id,
+                    "retrieval_vlm",
+                    result.selection_type,
+                    evidence,
+                    provenance,
+                )
+            else:
+                self.save_unresolved(unit, item, product_id, answer, result, evidence, provenance)
+
+    def assign_existing(self, item, norm, product_id, fields, answer) -> bool:
+        """Принимает действующую связь товара или утверждённое соответствие из SQL."""
+        with self.store.transaction() as unit:
+            unit.freeze_taxonomy()
+            product = unit.get("products", product_id, lock=True) if product_id else None
+            for decision in unit.all("classification_decisions", normalized_record_id=norm["id"]):
+                if (
+                    decision["status"] == "approved"
+                    and decision["category_id"]
+                    and decision["product_id"] == product_id
+                    and (not product or product["category_id"] == decision["category_id"])
+                    and unit.assignable_path(decision["category_id"])
+                ):
+                    self.finish_item(unit, item, "assigned", decision["category_id"], product_id)
+                    return True
+            if product and product["category_id"] and unit.assignable_path(product["category_id"]):
+                self.save_assignment(
+                    unit, item, product["category_id"], product_id, "existing_product"
+                )
+                return True
+            if product and product["category_id"] and unit.has_manual_product_category(product):
+                self.finish_item(unit, item, "needs_review", product_id=product_id)
+                unit.event(
+                    item["job_id"],
+                    "classification.unresolved",
+                    "Категория ручного решения недоступна",
+                    item_id=item["id"],
+                    level="warning",
+                )
+                return True
+            hint = unit.approved_category_hint(item["raw_record_id"], fields, answer)
+            if hint and unit.assignable_path(hint[0]):
+                self.save_assignment(
+                    unit, item, hint[0], product_id, hint[1], evidence={"approved_sql_hint": True}
+                )
+                return True
+        return False
+
+    def save_assignment(
+        self,
+        unit,
+        item,
+        category_id,
+        product_id,
+        method,
+        selection_type="exact",
+        evidence=None,
+        provenance=None,
+    ) -> None:
+        """Атомарно назначает категорию, завершает старые предложения и открытые задачи."""
+        normalized_id = item["normalized_record_id"]
+        for previous in unit.all("classification_decisions", normalized_record_id=normalized_id):
+            if previous["status"] in {"approved", "proposed"} and previous["method"] != "manual":
+                unit.update("classification_decisions", previous["id"], status="superseded")
+        unit.add(
+            "classification_decisions",
+            normalized_record_id=normalized_id,
+            product_id=product_id,
+            category_id=category_id,
+            method=method,
+            selection_type=selection_type,
+            status="approved",
+            decided_by="system",
+            evidence=evidence or {},
+            **(provenance or {}),
+        )
+        if product_id:
+            unit.update("products", product_id, category_id=category_id)
+        for task in unit.all("review_tasks", normalized_record_id=normalized_id, status="open"):
+            if task["kind"] in {"category_selection", "taxonomy_gap"}:
+                unit.update(
+                    "review_tasks",
+                    task["id"],
+                    status="resolved",
+                    actor="system",
+                    resolution={"category_id": str(category_id)},
+                    resolved_at=datetime.now(UTC),
+                )
+        for gap in unit.all("taxonomy_gaps", normalized_record_id=normalized_id, status="open"):
+            unit.update(
+                "taxonomy_gaps",
+                gap["id"],
+                status="resolved",
+                resolved_category_id=category_id,
+                resolved_by="system",
+                resolved_at=datetime.now(UTC),
+            )
+        self.finish_item(unit, item, "assigned", category_id, product_id)
+        row = unit.assignable_path(category_id)
+        unit.event(
+            item["job_id"],
+            "item.auto_assigned",
+            "Назначено автоматически: " + " → ".join(row["path_names"]),
+            item_id=item["id"],
+            data={"path": row["path_names"], "method": method},
+        )
+
+    def save_unresolved(self, unit, item, product_id, answer, result, evidence, provenance) -> None:
+        """Сохраняет причину и переиспользует открытую задачу при повторе."""
+        normalized_id = item["normalized_record_id"]
+        status = "needs_review" if result.unresolved else "no_suitable_category"
+        unit.add(
+            "classification_decisions",
+            normalized_record_id=normalized_id,
+            product_id=product_id,
+            method="retrieval_vlm",
+            selection_type="none",
+            status=status,
+            evidence=evidence,
+            **provenance,
+        )
+        kind = "category_selection" if result.unresolved else "taxonomy_gap"
+        if kind == "taxonomy_gap" and not unit.all(
+            "taxonomy_gaps", normalized_record_id=normalized_id, status="open"
+        ):
+            unit.add(
+                "taxonomy_gaps",
+                normalized_record_id=normalized_id,
+                product_id=product_id,
+                proposed_type=answer["product_type"],
+                evidence=evidence,
+            )
+        if not unit.all(
+            "review_tasks", normalized_record_id=normalized_id, kind=kind, status="open"
+        ):
             unit.add(
                 "review_tasks",
-                normalized_record_id=norm["id"],
-                product_id=product["id"],
-                kind="taxonomy_gap" if status == "no_suitable_category" else "category_selection",
-                context={"reason": selected["reason"]},
+                normalized_record_id=normalized_id,
+                product_id=product_id,
+                kind=kind,
+                context={"reason": result.reason},
             )
-            self.finish_item(
-                unit,
-                item,
-                "taxonomy_gap" if status == "no_suitable_category" else "needs_review",
-                None,
-                product["id"],
-            )
+        if result.technical_failure:
+            item = {**item, "issue_codes": [*item["issue_codes"], "classification_technical"]}
+        self.finish_item(
+            unit,
+            item,
+            "needs_review" if result.unresolved else "taxonomy_gap",
+            product_id=product_id,
+        )
+        unit.event(
+            item["job_id"],
+            "classification.unresolved",
+            result.reason[:500],
+            item_id=item["id"],
+            level="warning",
+        )
 
     def finish_item(self, unit, item: dict, status: str, category_id=None, product_id=None) -> None:
         """Коммитит результат позиции и event вместе со счётчиками."""
+        issue_codes = set(item["issue_codes"]) - {"reclassify_requested"}
+        if status == "assigned":
+            issue_codes -= {
+                "classification_technical",
+                "inference_unavailable",
+                "invalid_output",
+                "processing_error",
+                "taxonomy_changed",
+            }
         unit.update(
             "ingest_job_items",
             item["id"],
             status=status,
             category_id=category_id,
             product_id=product_id,
+            issue_codes=sorted(issue_codes),
         )
         if product_id:
             unit.attach_offer(item["raw_record_id"], product_id)
@@ -863,6 +1040,43 @@ class CatalogImport:
                 and previous["review_status"] == row["review_status"]
             )
         )
+
+    def reclassify(self, job_id, apply: bool = False) -> dict:
+        """Ставит прежние нерешённые позиции в очередь без чтения файлов и matching."""
+        with self.store.transaction() as unit:
+            job = unit.get("ingest_jobs", job_id, lock=apply)
+            if job["status"] not in {"completed", "completed_with_issues"}:
+                raise ConflictError("Повторная классификация доступна после завершения задания")
+            items = unit.reclassification_items(job["id"])
+            if apply and items:
+                for item in items:
+                    unit.update(
+                        "ingest_job_items",
+                        item["id"],
+                        status="pending",
+                        issue_codes=sorted(set(item["issue_codes"]) | {"reclassify_requested"}),
+                    )
+                unit.update(
+                    "ingest_jobs",
+                    job["id"],
+                    status="queued",
+                    cancel_requested=False,
+                    finished_at=None,
+                )
+                unit.refresh_counts(job["id"])
+                unit.event(
+                    job["id"],
+                    "job.reclassify",
+                    "Запрошена повторная классификация",
+                    data={"count": len(items)},
+                )
+        if apply and items:
+            try:
+                self.queue.publish(str(job_id))
+            except DependencyUnavailable:
+                # Worker публикует оставшиеся queued задания из PostgreSQL.
+                pass
+        return {"id": str(job_id), "eligible": len(items), "queued": bool(apply and items)}
 
     def control(self, job_id, action: str) -> dict:
         """Cancel сохраняет checkpoints; resume явно повторяет только технические ошибки."""
@@ -920,7 +1134,13 @@ class CatalogImport:
     def job(self, job_id) -> dict:
         """Возвращает status и реальные durable counters."""
         with self.store.transaction() as unit:
-            return json_value({**unit.get("ingest_jobs", job_id), "mode": self.inference.mode})
+            return json_value(
+                {
+                    **unit.get("ingest_jobs", job_id),
+                    **unit.assignment_counts(job_id),
+                    "mode": self.inference.mode,
+                }
+            )
 
     def items(self, job_id, status: str | None, query: str, offset: int, limit: int) -> dict:
         """Делегирует SQL pagination без загрузки raw payload всех позиций в браузер."""
@@ -931,7 +1151,7 @@ class CatalogImport:
     def report(self, job_id) -> dict:
         """Отчёт отражает фактические counters, issues и provenance без секретов."""
         with self.store.transaction() as unit:
-            job = unit.get("ingest_jobs", job_id)
+            job = {**unit.get("ingest_jobs", job_id), **unit.assignment_counts(job_id)}
             rows = unit.items_page(job_id, None, "", 0, self.settings.upload_max_rows)["items"]
             files = unit.all("ingest_job_files", job_id=job["id"])
             norm_ids = list({r["normalized_record_id"] for r in rows if r["normalized_record_id"]})
@@ -1091,7 +1311,7 @@ class CatalogImport:
             action = values.get("action", "assign_category")
             if action == "assign_category":
                 unit.freeze_taxonomy()
-                if not category_id or not self.valid_category(category_id):
+                if not unit.assignable_path(category_id):
                     raise CatalogError("Категория недоступна для назначения")
                 for decision in unit.all(
                     "classification_decisions", normalized_record_id=item["normalized_record_id"]

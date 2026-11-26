@@ -101,6 +101,8 @@ def test_browser_mapping_sheets_bulk_and_safe_text(browser_workspace, tmp_path):
         expect(page.locator("#bulk-items li")).to_have_count(1)
         page.locator("#bulk-confirm").click()
         expect(page.locator("#assigned-count")).to_have_text("1")
+        expect(page.locator("#manual-assigned-count")).to_have_text("1")
+        expect(page.locator("#auto-assigned-count")).to_have_text("0")
         page.locator("#files").set_input_files(xlsx_path)
         page.locator("#upload-button").click()
         page.wait_for_function(
@@ -246,7 +248,7 @@ def test_aitim200_browser_sql_qdrant(db_engine, tmp_path):
                 raise AssertionError(page.locator("#notice").inner_text() + str(errors)) from error
             page.locator("#decision-reason").fill("Проверено оператором E2E")
             page.locator("#assign-button").click()
-            expect(page.locator("#assigned-count")).to_have_text("1")
+            expect(page.locator("#manual-assigned-count")).to_have_text("1")
             indexed = service.index.sync()
             assert indexed["points"] == 2541
             category = next(
@@ -284,7 +286,10 @@ def test_aitim200_browser_sql_qdrant(db_engine, tmp_path):
                 assert len(unit.all("products")) == products_count
                 assert len(unit.all("price_observations")) == observations_count
                 repeated = unit.all("ingest_job_items", job_id=UUID(second_id))
-                assert sum(r["status"] == "assigned" for r in repeated) == 1
+                first_item = next(r for r in repeated if r["row_number"] == 1)
+                assert first_item["status"] == "assigned"
+                assert first_item["category_id"] == category["id"]
+            expect(page.locator("#manual-assigned-count")).to_have_text("1")
             assert before_ids <= {str(r["id"]) for r in service.store.categories()}
             assert not errors, errors
             report = {

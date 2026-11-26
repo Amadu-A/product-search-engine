@@ -19,7 +19,11 @@ export function connectEvents(jobId, onUpdate, onError) {
     [...records.values()].filter(record => (filter.value === 'all' || record.displayLevel === filter.value) && JSON.stringify(record).toLocaleLowerCase('ru').includes(query)).slice(-200).forEach(record => {
       const row = element('li', undefined, `events__${record.displayLevel}`);
       row.append(element('time', new Date(record.occurred_at).toLocaleTimeString('ru')));
-      const content = element('span', `${record.message}${record.data.source_name ? ' · ' + record.data.source_name : ''}`);
+      const path = record.data.path?.join(' → ');
+      const candidates = record.data.paths?.map(names => names.join(' → ')).join(' · ');
+      const detail = record.data.source_name || candidates ||
+        (record.type.startsWith('classification.') ? path : '');
+      const content = element('span', detail ? `${record.message} · ${detail}` : record.message);
       if (record.item_id) {
         const link = element('button', 'Подробнее'); link.type = 'button';
         link.addEventListener('click', () => list.dispatchEvent(new CustomEvent('select-item',{detail:record.item_id})));

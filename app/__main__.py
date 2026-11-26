@@ -78,6 +78,9 @@ def parser() -> argparse.ArgumentParser:
     report = commands.add_parser("import-report")
     report.add_argument("--job-id", required=True)
     report.add_argument("--summary", action="store_true")
+    reclassify = commands.add_parser("reclassify", help="Повторная классификация записей задания")
+    reclassify.add_argument("--job-id", required=True)
+    reclassify.add_argument("--apply", action="store_true")
     decision = commands.add_parser("review-item")
     decision.add_argument("--item-id", required=True)
     decision.add_argument("--decision-file", type=Path, required=True)
@@ -136,6 +139,7 @@ def dispatch(args: argparse.Namespace, settings: Settings) -> dict:
         "worker",
         "import-file",
         "import-report",
+        "reclassify",
         "review-item",
         "create-category",
         "taxonomy-index-status",

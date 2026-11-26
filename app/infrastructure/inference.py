@@ -7,7 +7,10 @@ import math
 import re
 import threading
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
+from uuid import UUID
 
 import httpx
 from jsonschema import Draft202012Validator
@@ -23,7 +26,11 @@ class SharedInference:
         """Загружает неизменённые prompt/schema и ограниченные HTTP timeouts."""
         self.settings = settings
         self.prompts, self.schemas = {}, {}
-        for step, name in ((1, "product_understanding"), (2, "category_selection")):
+        for step, name in (
+            (1, "product_understanding"),
+            (2, "category_selection"),
+            (3, "hierarchical_selection"),
+        ):
             self.prompts[step] = Path(f"docs/prompts/answer_{step}_{name}.txt").read_text(
                 encoding="utf-8"
             )
@@ -36,6 +43,7 @@ class SharedInference:
         self.mode = settings.inference_mode
         self.probe_times = {}
         self.semaphore = threading.BoundedSemaphore(settings.inference_concurrency)
+        self.usage = ContextVar("classification_vlm_usage", default=None)
         self.model_revision = (
             "mock-v1" if self.mode == "mock" else settings.shared_vlm_model_revision
         )
@@ -71,9 +79,29 @@ class SharedInference:
         with self.semaphore:
             return self._request(url, payload)
 
+    @contextmanager
+    def budget(self):
+        """Ограничивает все запросы завершения, включая повтор HTTP и исправление JSON."""
+        usage = {"vlm_requests": 0}
+        token = self.usage.set(usage)
+        try:
+            yield usage
+        finally:
+            self.usage.reset(token)
+
+    def consume_request(self) -> None:
+        """Считает только запросы VLM текущей позиции, отдельно от embedding."""
+        usage = self.usage.get()
+        if usage is not None:
+            if usage["vlm_requests"] >= self.settings.classification_vlm_budget:
+                raise DependencyUnavailable("Исчерпан бюджет VLM на позицию")
+            usage["vlm_requests"] += 1
+
     def _request(self, url: str, payload: dict) -> dict:
         """Повторяет только timeout/429/5xx, ограниченно и без логирования payload."""
         for attempt in range(self.settings.inference_retries + 1):
+            if url.endswith("/chat/completions"):
+                self.consume_request()
             try:
                 response = self.client.post(url, json=payload)
                 if response.status_code == 429 or response.status_code >= 500:
@@ -134,66 +162,137 @@ class SharedInference:
             ) from error
 
     def answer(self, step: int, values: dict) -> dict:
-        """Проверяет schema, evidence и принадлежность выбранного UUID candidate-set."""
+        """Валидирует ответ, при технической ошибке запрашивает ровно одно исправление."""
         metadata = self.provenance(step, values)
         prompt = self.render_prompt(step, values)
-        if self.mode == "mock":
-            answer = self.mock_answer(step, values)
-            raw = json.dumps(answer, ensure_ascii=False)
-        else:
-            if self.model_revision == "unverified":
-                raise DependencyUnavailable("SHARED_VLM_MODEL_REVISION не проверена оператором")
-            result = self.request(
-                self.settings.shared_vlm_base_url.rstrip("/") + "/chat/completions",
-                {
-                    "model": self.settings.shared_vlm_model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0,
-                    "max_tokens": self.settings.inference_max_tokens,
-                    "response_format": {
-                        "type": "json_schema",
-                        "json_schema": {"name": f"answer_{step}", "schema": self.schemas[step]},
-                    },
-                    "chat_template_kwargs": {"enable_thinking": False},
-                },
-            )
-            raw = None
+        attempts = []
+        for _ in range(2):
             try:
-                raw = result["choices"][0]["message"]["content"]
-                answer = json.loads(raw)
-            except (KeyError, IndexError, TypeError, ValueError) as error:
-                raise InvalidModelOutput("invalid_output: модель не вернула JSON", raw) from error
-        errors = list(Draft202012Validator(self.schemas[step]).iter_errors(answer))
-        if errors:
-            raise InvalidModelOutput("invalid_output: ответ не соответствует schema", raw)
+                raw, finish = self.completion(step, values, prompt)
+                answer = self.validate_answer(step, values, raw, finish)
+            except InvalidModelOutput as error:
+                attempts.append(error.diagnostic())
+                if len(attempts) == 2 or self.mode == "mock":
+                    error.attempts = attempts
+                    raise
+                prompt += (
+                    "\n\nПредыдущий ответ отклонён. Исправь следующую ошибку: "
+                    + str(error)
+                    + ". Верни только полный JSON согласно схеме и исходным ограничениям."
+                )
+            except DependencyUnavailable as error:
+                if attempts:
+                    invalid = InvalidModelOutput(str(error), None, code="technical", step=step)
+                    invalid.attempts = [*attempts, invalid.diagnostic()]
+                    raise invalid from error
+                raise
+            else:
+                return {
+                    **metadata,
+                    "answer_json": answer,
+                    "raw_response_text": raw,
+                    "finish_reason": finish,
+                    "attempts": attempts,
+                    "mode": self.mode,
+                }
+        raise AssertionError("Не достигнут результат валидации")
+
+    def completion(self, step: int, values: dict, prompt: str) -> tuple[object, str | None]:
+        """Читает финальный content и finish_reason одного завершения."""
+        if self.mode == "mock":
+            self.consume_request()
+            return json.dumps(self.mock_answer(step, values), ensure_ascii=False), "stop"
+        result = self.request(
+            self.settings.shared_vlm_base_url.rstrip("/") + "/chat/completions",
+            {
+                "model": self.settings.shared_vlm_model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0,
+                "max_tokens": self.settings.inference_max_tokens,
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"name": f"answer_{step}", "schema": self.schemas[step]},
+                },
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+        )
+        try:
+            choice = result["choices"][0]
+            return choice["message"]["content"], choice.get("finish_reason")
+        except (KeyError, IndexError, TypeError) as error:
+            raise InvalidModelOutput(
+                "Неверная структура ответа API", result, code="technical", step=step
+            ) from error
+
+    def validate_answer(self, step: int, values: dict, raw: object, finish: str | None) -> dict:
+        """Проверяет JSON, схему, UUID, evidence и согласованность полей."""
+
+        def invalid(code: str, message: str) -> InvalidModelOutput:
+            """Сохраняет исходный ответ, причину и этап."""
+            return InvalidModelOutput(message, raw, code=code, step=step, finish_reason=finish)
+
+        if finish == "length":
+            raise invalid("truncated", "Генерация оборвалась по лимиту")
+        if finish not in {None, "stop"}:
+            raise invalid("technical", "API завершил генерацию без штатного ответа")
+        try:
+            answer = json.loads(raw)
+        except (TypeError, ValueError) as error:
+            raise invalid("json", "Модель не вернула корректный JSON") from error
+        error = next(Draft202012Validator(self.schemas[step]).iter_errors(answer), None)
+        if error:
+            field = ".".join(map(str, error.absolute_path)) or "корень"
+            suffix = (
+                f" ({', '.join(sorted(set(error.validator_value) - answer.keys()))})"
+                if (error.validator == "required" and isinstance(answer, dict))
+                else ""
+            )
+            raise invalid("schema", f"Нарушена JSON Schema: {field}, {error.validator}{suffix}")
+        if step in {2, 3}:
+            identifiers = [answer["category_id"]] if answer["category_id"] is not None else []
+            identifiers += answer.get("compared_candidate_ids", [])
+            try:
+                for identifier in identifiers:
+                    UUID(identifier)
+            except ValueError as error:
+                raise invalid("uuid", "Неверный формат UUID категории") from error
+        if step == 3:
+            current = values["current_category_json"]
+            actions = {
+                "select_child": {c["category_id"] for c in values["child_categories_json"]},
+                "select_current": {current["category_id"]}
+                if current and current["is_assignable"]
+                else set(),
+                "no_match": {None},
+            }
+            if answer["category_id"] not in actions[answer["action"]]:
+                raise invalid("uuid", "UUID не разрешён для действия на этом уровне")
+            return answer
         if step == 1:
             allowed = {e["evidence_id"] for e in values["evidence_bundle_json"]["evidence"]}
             used = set(answer["evidence_ids"])
             for attribute in answer["attributes"]:
                 used.update(attribute["evidence_ids"])
+            if answer["status"] == "recognized" and not used:
+                raise invalid("evidence", "recognized без evidence")
         else:
             allowed = set(values["answer_1_json"]["evidence_ids"])
             for attribute in values["answer_1_json"]["attributes"]:
                 allowed.update(attribute["evidence_ids"])
             used = set(answer["supporting_evidence_ids"])
             candidates = {str(c["category_id"]) for c in values["category_candidates_json"]}
-            if not set(answer["compared_candidate_ids"]) <= candidates or (
-                answer["category_id"] and answer["category_id"] not in candidates
+            if not set(identifiers) <= candidates:
+                raise invalid("uuid", "Категория вне candidate-set")
+            if (answer["status"] == "selected") != (
+                answer["category_id"] is not None and answer["selection_type"] != "none"
+            ) or (
+                answer["status"] != "selected"
+                and (answer["category_id"] is not None or answer["selection_type"] != "none")
             ):
-                raise InvalidModelOutput("invalid_output: категория вне candidate-set", raw)
-            if answer["status"] == "selected" and (
-                not answer["category_id"] or answer["selection_type"] == "none"
-            ):
-                raise InvalidModelOutput("invalid_output: неполное решение selected", raw)
-            if answer["status"] != "selected" and (
-                answer["category_id"] is not None or answer["selection_type"] != "none"
-            ):
-                raise InvalidModelOutput("invalid_output: противоречивое решение", raw)
+                raise invalid("status", "Противоречивые status, category_id и selection_type")
         if not used <= allowed:
-            raise InvalidModelOutput("invalid_output: вымышленные evidence IDs", raw)
-        if step == 1 and answer["status"] == "recognized" and not used:
-            raise InvalidModelOutput("invalid_output: recognized без evidence", raw)
-        return {**metadata, "answer_json": answer, "raw_response_text": raw, "mode": self.mode}
+            raise invalid("evidence", "Недопустимые evidence IDs")
+        return answer
 
     def render_prompt(self, step: int, values: dict) -> str:
         """Подставляет только placeholders исходного шаблона, не интерпретируя их внутри данных."""
@@ -208,6 +307,8 @@ class SharedInference:
 
     def mock_answer(self, step: int, values: dict) -> dict:
         """Синтетическая детерминированная заглушка; результат всегда помечен MOCK."""
+        if step == 3:
+            return {"action": "no_match", "category_id": None, "reason": "MOCK: нет совпадения"}
         if step == 2:
             candidates = values["category_candidates_json"]
             selected = candidates[0]["category_id"] if candidates else None
@@ -215,7 +316,7 @@ class SharedInference:
                 "status": "selected" if selected else "no_suitable_category",
                 "category_id": selected,
                 "selection_type": "broader" if selected else "none",
-                "reason": "MOCK: синтетический выбор; требуется ручная проверка",
+                "reason": "MOCK: синтетический выбор",
                 "supporting_evidence_ids": values["answer_1_json"]["evidence_ids"],
                 "compared_candidate_ids": [c["category_id"] for c in candidates],
             }

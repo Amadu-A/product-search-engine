@@ -26,6 +26,10 @@ class CatalogStore(Protocol):
         """Читает актуальное дерево из SQL."""
         ...
 
+    def index_snapshot(self) -> tuple[int, list[dict]]:
+        """Читает revision и дерево в одном согласованном снимке."""
+        ...
+
     def record_lock(self, record_id) -> Any:
         """Сериализует обработку общей normalized записи."""
         ...
@@ -37,6 +41,10 @@ class Understanding(Protocol):
     mode: str
     model_revision: str
     embedding_revision: str
+
+    def budget(self) -> Any:
+        """Ограничивает и считает запросы VLM одной позиции."""
+        ...
 
     def provenance(self, step: int, values: dict, resolve: bool = True) -> dict:
         """Формирует проверяемый ключ cache."""

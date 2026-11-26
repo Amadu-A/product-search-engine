@@ -137,9 +137,16 @@ docker compose --env-file .env.example --env-file .env run --rm --no-deps app im
 
 Без `--apply` CLI не пишет jobs/raw/товары. HTTP upload сохраняет preview job,
 а `start` ставит его в durable очередь. Ручные решения имеют приоритет при повторе;
-VLM предлагает категории, утверждение человеком отдельно. Файл mapping:
+Валидный выбор VLM автоматически назначает категорию. Оператор может изменить
+назначение, и его решение сохраняется при повторной обработке. Файл mapping:
 `{"fields":{"name":"Описание","price":"Стоимость"},"confirmed":true}`.
 Для продолжения CLI: `import-file --job-id UUID --apply`.
+
+Для ранее завершённого задания `reclassify --job-id UUID` покажет число строк
+к повторной классификации, а `reclassify --job-id UUID --apply` поставит их в очередь.
+Команда работает с сохранёнными данными задания, даже если файл загрузки истёк.
+Проверка A/B/C на aistation: `bash scripts/test.sh --classification-live`.
+[Реализация и проверки 02.4](docs/reports/stage-02-4.md).
 
 [Операции, транзакции и восстановление](docs/import.md) ·
 [ТЗ](docs/technical-assignment.md) · [Матрица тестов](docs/test-matrix.md) ·

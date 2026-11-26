@@ -34,7 +34,15 @@
       <div class="progress__controls"><span id="job-status">Нет задания</span><button type="button" id="cancel-button" disabled>Остановить</button><button type="button" id="resume-button" disabled>Продолжить</button><a id="report-json" hidden>Отчёт JSON</a><a id="report-csv" hidden>CSV</a></div>
       <div class="toolbar"><label>События<select id="event-filter"><option value="all">Все</option><option value="success">Успешные</option><option value="warning">На проверке</option><option value="error">Ошибки</option></select></label><label>Поиск в ленте<input id="event-search" type="search" placeholder="Имя или record_id"></label></div>
       <ol id="events" class="events" aria-label="События обработки"></ol>
-      <div class="counters"><div class="counter counter--ok">Назначено<strong id="assigned-count">0</strong></div><div class="counter counter--review">На проверке<strong id="review-count">0</strong></div><div class="counter counter--gap">Нет категории<strong id="gap-count">0</strong></div><div class="counter">Ошибки<strong id="error-count">0</strong></div></div>
+      <span id="assigned-count" hidden>0</span>
+      <div class="counters">
+        <div class="counter counter--ok">Автоматически<strong id="auto-assigned-count">0</strong></div>
+        <div class="counter counter--ok">Вручную<strong id="manual-assigned-count">0</strong></div>
+        <div class="counter counter--review">На проверке<strong id="review-count">0</strong></div>
+        <div class="counter counter--gap">Нет категории<strong id="gap-count">0</strong></div>
+        <div class="counter">Не товар<strong id="not-product-count">0</strong></div>
+        <div class="counter">Ошибки<strong id="error-count">0</strong></div>
+      </div>
     </section>
     <section class="panel review"><div class="section-heading"><h2>Позиции и ручная проверка</h2><span id="items-total">0 позиций</span></div>
       <div class="toolbar"><label>Поиск<input id="item-search" type="search" placeholder="Наименование"></label><label>Статус<select id="item-status"><option value="">Все</option><option value="needs_review">На проверке</option><option value="taxonomy_gap">Нет категории</option><option value="assigned">Назначено</option><option value="not_product">Не товар</option><option value="invalid_record">Некорректные</option><option value="error">Ошибки</option></select></label></div>

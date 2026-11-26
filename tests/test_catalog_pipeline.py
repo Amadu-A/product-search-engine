@@ -102,7 +102,7 @@ def test_reimport_manual_priority_and_observations(catalog, tmp_path):
         items = sorted(
             unit.all("ingest_job_items", job_id=UUID(first)), key=lambda i: i["item_position"]
         )
-        assert [i["status"] for i in items] == ["needs_review", "not_product", "needs_review"]
+        assert [i["status"] for i in items] == ["taxonomy_gap", "not_product", "needs_review"]
         assert len(unit.all("products")) == 1
         assert len(unit.all("price_observations")) == 1
         assert not unit.all("price_history")

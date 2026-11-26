@@ -70,7 +70,9 @@ class DependencyUnavailable(RuntimeError):
 class InvalidModelOutput(CatalogError):
     """Невалидный финальный ответ сохраняется для аудита, но не принимается решением."""
 
-    def __init__(self, message: str, raw_response: object):
+    def __init__(
+        self, message: str, raw_response: object, *, code="technical", step=None, finish_reason=None
+    ):
         """Отделяет безопасную диагностику от исходного model output."""
         super().__init__(message)
         self.raw_response = (
@@ -78,6 +80,20 @@ class InvalidModelOutput(CatalogError):
             if isinstance(raw_response, str) or raw_response is None
             else json.dumps(raw_response, ensure_ascii=False)
         )
+        self.code = code
+        self.step = step
+        self.finish_reason = finish_reason
+        self.attempts = [self.diagnostic()]
+
+    def diagnostic(self) -> dict:
+        """Возвращает данные технического аудита без раскрытия их в сообщении SSE."""
+        return {
+            "code": self.code,
+            "step": self.step,
+            "reason": str(self),
+            "raw_response_text": self.raw_response,
+            "finish_reason": self.finish_reason,
+        }
 
 
 @dataclass
@@ -153,6 +169,54 @@ def is_bare_identifier(fields: dict) -> bool:
         and re.search(r"\d", name)
         and re.search(r"[A-Za-zА-Яа-я]", name)
     )
+
+
+def raw_type_understanding(fields: dict) -> dict | None:
+    """Распознаёт только явно написанные типы при техническом отказе answer_1."""
+    name = fields.get("name") or ""
+    if re.search(r"\b(каталог|коллекция|подборка|категория)\b", name, re.I):
+        return None
+    match = re.search(
+        r"\b(кабель|провод|выключатель|переключатель|розетка|лоток|цемент|"
+        r"штукатурка|труба|муфта|клапан|герметик|саморез|болт|гайка|шайба)\b",
+        name,
+        re.I,
+    )
+    if not match or is_bare_identifier(fields):
+        return None
+    # Сохраняем квалифицирующий контекст вроде «лоток медицинский».
+    return {
+        "status": "recognized",
+        "record_kind": "product_candidate",
+        "product_type": name[:500],
+        "generic_type": match[0],
+        "purpose": None,
+        "applications": [],
+        "attributes": [],
+        "evidence_ids": ["raw_name"],
+        "brand_candidate": None,
+        "manufacturer_candidate": None,
+        "mpn_candidate": None,
+        "reason": "Тип явно указан в исходном наименовании",
+    }
+
+
+def category_purpose_conflict(name: str, path: list[str]) -> str | None:
+    """Отсекает конфликт назначения медицинских лотков с отраслевыми ветками."""
+    source = (normalize_text(name) or "").casefold()
+    branch = (normalize_text(" ".join(path)) or "").casefold()
+    medical = r"\b(?:медицинск|хирургическ|стоматологическ|стерилизац)\w*"
+    is_tray = re.search(r"\b(?:лоток|лотк\w+)\b", source)
+    medical_tray = is_tray and (
+        re.search(medical, source) or re.search(r"\bпочкообразн\w*", source)
+    )
+    specialized_branch = re.search(
+        r"\b(?:электрик|электромонтаж|кабел|маляр|лакокрас|теплотрасс|дренаж|водоотвод)\w*",
+        branch,
+    )
+    if medical_tray and specialized_branch and not re.search(medical, branch):
+        return "Назначение медицинского лотка не соответствует выбранной ветке"
+    return None
 
 
 def identity_features(name: str | None) -> dict:

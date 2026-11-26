@@ -29,6 +29,10 @@ class JobView(BaseModel):
     total_count: int
     processed_count: int
     assigned_count: int
+    auto_assigned_count: int = 0
+    manual_assigned_count: int = 0
+    not_product_count: int = 0
+    technical_error_count: int = 0
     needs_review_count: int
     taxonomy_gap_count: int
     error_count: int
@@ -90,6 +94,7 @@ class ItemView(BaseModel):
     raw_record_id: UUID | None
     name: str | None = None
     category_name: str | None = None
+    assignment_origin: Literal["manual", "auto"] | None = None
 
 
 class ItemsPage(BaseModel):

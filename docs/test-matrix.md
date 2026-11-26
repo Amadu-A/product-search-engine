@@ -1,6 +1,15 @@
 <!-- docs/test-matrix.md -->
 # Матрица различий и регрессий
 
+| Сценарий 02.4 | Проверяемое поведение | Тест |
+| --- | --- | --- |
+| Валидный broader, отсутствуют цена/единица/MPN/бренд | Нормализованная строка и существующая связь Product получают категорию | test_category_classification |
+| Пустые кандидаты или ошибка Qdrant | Обход PostgreSQL, остановка на общей категории, no_match для неподходящего лотка | test_category_classification |
+| Обрыв, JSON Schema и недопустимый UUID | Точная причина и один ограниченный запрос исправления | test_category_classification |
+| Повтор старого proposed | Переиспользуются сохранённый answer_1 и Product, ручное решение сохраняется | test_category_classification |
+| Автоматический и ручной итог | Раздельные счётчики в Chromium после назначения | test_catalog_browser |
+| A/B/C AITIM-200 | Реальные shared VLM/embedding и временные PostgreSQL/Qdrant | test_classification_live, `bash scripts/test.sh --classification-live` |
+
 Этап 02 дополняет, сохраняет и повторно запускает приведённые ниже проверки этапа 01.
 Актуальный pilot — AITIM-200 и SQL fixture 2540 категорий, не старые 2775.
 `examples/*labeled*` — assisted proposal, не Gold; точность моделей не выводится из mock.

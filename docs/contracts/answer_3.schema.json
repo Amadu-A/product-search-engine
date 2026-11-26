@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:product-search:answer-3:v1",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "action": {"type": "string", "enum": ["select_child", "select_current", "no_match"]},
+    "category_id": {"type": ["string", "null"]},
+    "reason": {"type": "string", "minLength": 1}
+  },
+  "required": ["action", "category_id", "reason"]
+}

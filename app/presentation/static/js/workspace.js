@@ -135,10 +135,13 @@ async function refresh() {
   $('#progress').value = job.total_count ? job.processed_count / job.total_count * 100 : 0;
   $('#progress-label').textContent = `Обработано ${job.processed_count} / ${job.total_count}`;
   $('#job-status').textContent = labels[job.status] || job.status;
-  $('#assigned-count').textContent = job.assigned_count;
+  $('#assigned-count').textContent = job.auto_assigned_count + job.manual_assigned_count;
+  $('#auto-assigned-count').textContent = job.auto_assigned_count;
+  $('#manual-assigned-count').textContent = job.manual_assigned_count;
+  $('#not-product-count').textContent = job.not_product_count;
   $('#review-count').textContent = job.needs_review_count;
   $('#gap-count').textContent = job.taxonomy_gap_count;
-  $('#error-count').textContent = job.error_count;
+  $('#error-count').textContent = job.technical_error_count;
   $('#cancel-button').disabled = terminal.has(job.status) || job.status === 'preview_ready';
   $('#resume-button').disabled = !terminal.has(job.status);
   $('#start-button').disabled = job.status !== 'preview_ready' || !state.preview?.can_start;
@@ -162,7 +165,8 @@ async function refreshItems() {
     checkbox.addEventListener('change', () => { if (checkbox.checked) state.bulk.set(item.id, {id:item.id,expected_version:item.processing_version}); else state.bulk.delete(item.id); updateBulk(); }); choice.append(checkbox); row.append(choice);
     const name = element('td'); const button = element('button', item.name || '(без названия)'); button.type = 'button'; button.dataset.itemId = item.id;
     button.addEventListener('click', () => selectItem(item.id).catch(fail)); name.append(button);
-    row.append(name, element('td', labels[item.status] || item.status), element('td', item.category_name || '—'));
+    const status = {auto: 'Автоматически', manual: 'Вручную'}[item.assignment_origin] || labels[item.status] || item.status;
+    row.append(name, element('td', status), element('td', item.category_name || '—'));
     $('#items').append(row);
   });
   $('#page-label').textContent = `${Math.floor(state.offset / 50) + 1} / ${Math.max(1, Math.ceil(result.total / 50))}`;
@@ -177,7 +181,11 @@ async function selectItem(itemId) {
   $('#detail-raw').textContent = JSON.stringify(detail.raw?.payload, null, 2);
   const understanding = detail.understandings.map(({raw_response_text,...answer}) => answer);
   const decisions = detail.decisions.map(decision => ({...decision,evidence:{...decision.evidence,raw_response_text:undefined}}));
-  $('#detail-trace').textContent = JSON.stringify({understanding, matching: detail.matches, classification: decisions, observations: detail.observations}, null, 2);
+  $('#detail-trace').textContent = JSON.stringify(
+    {understanding, matching: detail.matches, classification: decisions, observations: detail.observations},
+    (key, value) => key === 'raw_response_text' ? undefined : value,
+    2
+  );
   $('#detail-issues').replaceChildren(...(detail.normalized?.issues || []).map(issue => element('p', `${issue.code}: ${issue.message}`, 'issue')));
   $('#assign-button').disabled = !state.category;
   $('#confirm-product').disabled = !detail.item.product_id;

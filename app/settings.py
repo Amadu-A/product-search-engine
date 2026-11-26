@@ -57,6 +57,7 @@ class Settings(BaseSettings):
     inference_retries: int = Field(default=1, ge=0, le=3)
     inference_concurrency: int = Field(default=2, ge=1, le=8)
     inference_max_tokens: int = Field(default=1200, ge=128, le=8192)
+    classification_vlm_budget: int = Field(default=10, ge=3, le=30)
     inference_max_input_chars: int = Field(default=16000, ge=1000, le=64000)
     qdrant_url: str = "http://qdrant:6333"
     qdrant_api_key: SecretStr = SecretStr("")

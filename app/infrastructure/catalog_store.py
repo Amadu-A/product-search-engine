@@ -327,6 +327,62 @@ class CatalogSession:
         self.update("ingest_jobs", job_id, **counts)
         return counts
 
+    def reclassification_items(self, job_id) -> list[dict]:
+        """Выбирает незакрытые решения, исключая утверждённые вручную записи."""
+        items, decisions = (self.table(n) for n in ("ingest_job_items", "classification_decisions"))
+        related = decisions.c.normalized_record_id == items.c.normalized_record_id
+        manual = sa.exists().where(
+            related, decisions.c.method == "manual", decisions.c.status == "approved"
+        )
+        proposed = sa.exists().where(related, decisions.c.status == "proposed")
+        query = sa.select(items).where(
+            items.c.job_id == UUID(str(job_id)),
+            items.c.normalized_record_id.is_not(None),
+            ~manual,
+            sa.or_(items.c.status.in_(["needs_review", "taxonomy_gap"]), proposed),
+        )
+        return [dict(row) for row in self.connection.execute(query).mappings()]
+
+    def manual_category_exists(self, items):
+        """Определяет ручное назначение по действующему решению и той же категории."""
+        decisions = self.table("classification_decisions")
+        return sa.exists().where(
+            decisions.c.normalized_record_id == items.c.normalized_record_id,
+            decisions.c.category_id == items.c.category_id,
+            decisions.c.method == "manual",
+            decisions.c.status == "approved",
+        )
+
+    def assignment_counts(self, job_id) -> dict[str, int]:
+        """Считает ручные, автоматические и исключённые строки без изменения схемы."""
+        items = self.table("ingest_job_items")
+        manual = self.manual_category_exists(items)
+        assigned = items.c.status == "assigned"
+        query = sa.select(
+            sa.func.count().filter(assigned & ~manual).label("auto_assigned_count"),
+            sa.func.count().filter(assigned & manual).label("manual_assigned_count"),
+            sa.func.count().filter(items.c.status == "not_product").label("not_product_count"),
+            sa.func.count()
+            .filter(
+                sa.or_(
+                    items.c.status.in_(["error", "invalid_record"]),
+                    (items.c.status == "needs_review")
+                    & sa.or_(
+                        *[
+                            items.c.issue_codes.contains([code])
+                            for code in (
+                                "classification_technical",
+                                "invalid_output",
+                                "inference_unavailable",
+                            )
+                        ]
+                    ),
+                )
+            )
+            .label("technical_error_count"),
+        ).where(items.c.job_id == UUID(str(job_id)))
+        return dict(self.connection.execute(query).mappings().one())
+
     def item_details(self, item_id) -> dict:
         """Собирает trace raw → normalized → understanding → matching → classification."""
         item = self.get("ingest_job_items", item_id)
@@ -377,6 +433,11 @@ class CatalogSession:
                 items,
                 norm.c.normalized_name.label("name"),
                 categories.c.name.label("category_name"),
+                sa.case(
+                    (items.c.status != "assigned", None),
+                    (self.manual_category_exists(items), "manual"),
+                    else_="auto",
+                ).label("assignment_origin"),
             )
             .select_from(source)
             .where(*condition)
@@ -495,6 +556,45 @@ class CatalogSession:
     def freeze_taxonomy(self) -> None:
         """Закрывает гонку SQL-проверки и назначения короткой SHARE-блокировкой дерева."""
         self.connection.execute(sa.text("LOCK TABLE categories IN SHARE MODE"))
+
+    def assignable_path(self, category_id) -> dict | None:
+        """Читает действительный путь назначения внутри транзакции решения."""
+        table = self.table("categories")
+        path, visited = [], set()
+        while category_id:
+            key = UUID(str(category_id))
+            if key in visited:
+                return None
+            visited.add(key)
+            row = (
+                self.connection.execute(sa.select(table).where(table.c.id == key))
+                .mappings()
+                .first()
+            )
+            if not row or not row["is_active"] or row["review_status"] == "deprecated":
+                return None
+            path.append(dict(row))
+            category_id = row["parent_id"]
+        if not path or not path[0]["is_assignable"]:
+            return None
+        return {
+            **path[0],
+            "path_ids": [str(row["id"]) for row in reversed(path)],
+            "path_names": [row["name"] for row in reversed(path)],
+        }
+
+    def has_manual_product_category(self, product: dict) -> bool:
+        """Находит ручное назначение Product, в том числе из другой исходной строки."""
+        decisions = self.table("classification_decisions")
+        query = sa.select(
+            sa.exists().where(
+                decisions.c.product_id == product["id"],
+                decisions.c.category_id == product["category_id"],
+                decisions.c.status == "approved",
+                decisions.c.method == "manual",
+            )
+        )
+        return bool(self.connection.scalar(query))
 
     def assign_record_items(self, record_id, category_id) -> set:
         """Обновляет все представления одной записи и инвалидирует старые expected_version."""
