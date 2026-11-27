@@ -12,6 +12,11 @@
               <xs:element name="brand" type="xs:string" minOccurs="0"/>
               <xs:element name="manufacturer" type="xs:string" minOccurs="0"/>
               <xs:element name="mpn" type="xs:string" minOccurs="0"/>
+              <xs:element name="model" type="xs:string" minOccurs="0"/>
+              <xs:element name="mark" type="xs:string" minOccurs="0"/>
+              <xs:element name="series" type="xs:string" minOccurs="0"/>
+              <xs:element name="seller_sku" type="xs:string" minOccurs="0"/>
+              <xs:element name="technical_characteristics" type="xs:string" minOccurs="0"/>
               <xs:element name="unit" type="xs:string" minOccurs="0"/>
               <xs:element name="quantity" type="xs:decimal" minOccurs="0"/>
               <xs:element name="price" type="xs:decimal" minOccurs="0"/>

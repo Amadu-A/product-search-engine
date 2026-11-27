@@ -112,6 +112,7 @@ async function loadProducts() {
       state.offset = (count - 1) * pageSize;
       return loadProducts();
     }
+    if (state.productId && !page.items.some(product => product.id === state.productId)) closeProduct();
     $('#catalog-products').replaceChildren(...page.items.map(listRow));
     $('#catalog-total').textContent = `Товаров: ${number.format(page.total)}`;
     $('#catalog-empty').hidden = page.total !== 0;
@@ -222,7 +223,8 @@ function showOffer(offer, offerOffset) {
   head.append(element('h4', offer.seller_name || 'Продавец не указан'));
   const amount = point?.verified_amount ?? point?.amount;
   const currency = point?.verified_currency ?? point?.currency;
-  if (amount != null) head.append(element('strong', formatPrice(amount, currency)));
+  const unit = point?.verified_unit ?? point?.sale_unit;
+  if (amount != null) head.append(element('strong', `${formatPrice(amount, currency)}${unit ? ` / ${unit}` : ''}`));
   card.append(head, element('p', offer.source_name, 'muted'));
   if (amount != null && !currency) card.append(element('small', 'Валюта не указана', 'catalog-card__date'));
   if (offer.origin_url) card.append(sourceLink(offer.origin_url, offer.original_name || 'Страница предложения'));

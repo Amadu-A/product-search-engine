@@ -85,6 +85,7 @@ def parser() -> argparse.ArgumentParser:
     )
     reclassify.add_argument("--apply", action="store_true")
     merge = commands.add_parser("merge-products", help="Объединение доказанных дублей")
+    merge.add_argument("--verified-facts", type=Path, help="Отдельный JSON проверенных документов")
     merge.add_argument("--apply", action="store_true")
     merge.add_argument("--expected-sha256")
     merge.add_argument("--idempotency-key")

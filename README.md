@@ -72,6 +72,8 @@ $env:MSYS_NO_PATHCONV = '1'
 Поддерживаются четыре входных формата. Обязательное поле — `name`.
 Дополнительные: `source_key`, `brand`, `manufacturer`, `mpn`, `unit`, `quantity`,
 `price`, `currency`, `price_date`, `seller`, `seller_inn`, `product_url`, `category_path`.
+Поля идентификации `model`, `mark`, `series`, `seller_sku` и
+`technical_characteristics` можно передать отдельными строками.
 `price`/`quantity` — десятичные строки; отсутствующие валюту/единицу не угадываем.
 Seller не становится Brand/Manufacturer. Исходные байты и raw сохраняются отдельно.
 
@@ -163,6 +165,10 @@ docker compose --env-file .env.example --env-file .env run --rm --no-deps app im
 [Реализация и проверки 02.4](docs/reports/stage-02-4.md).
 [Исправления после ревью 75e1198](docs/reports/stage-02-4-review.md).
 [Сравнение с рабочим импортом AITIM-200](docs/reports/stage-02-4-aitim-followup.md).
+
+Проверка идентичности, opt-in benchmark и операции `merge-products` описаны
+в [инструкции по объединению](docs/product-matching.md).
+[Результаты этапа 03.5](docs/reports/stage-03-5-identity.md).
 
 [Операции, транзакции и восстановление](docs/import.md) ·
 [ТЗ](docs/technical-assignment.md) · [Матрица тестов](docs/test-matrix.md) ·

@@ -43,7 +43,12 @@ def dispatch_catalog(args, settings) -> dict:
         }
     service = build_catalog(settings)
     if args.command == "merge-products":
-        merge = ProductMerge(service.store)
+        facts = []
+        if args.verified_facts:
+            if args.verified_facts.stat().st_size > 1024 * 1024:
+                raise CatalogError("Файл проверенных документов превышает 1 МиБ")
+            facts = json.loads(args.verified_facts.read_text(encoding="utf-8-sig"))
+        merge = ProductMerge(service.store, facts)
         if not args.apply:
             return merge.preview()
         if (

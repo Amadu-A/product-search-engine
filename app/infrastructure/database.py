@@ -205,7 +205,7 @@ def check_database(engine: Engine) -> dict:
         revision = connection.execute(
             sa.text("SELECT version_num FROM alembic_version")
         ).scalar_one()
-        if revision != "0005_product_identity":
+        if revision != "0006_identity_physical_merge":
             raise TaxonomyError("Версия schema не соответствует приложению")
         count = connection.execute(sa.select(sa.func.count()).select_from(categories)).scalar_one()
     return {"status": "ready", "revision": revision, "categories": count}

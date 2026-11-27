@@ -17,6 +17,11 @@ FIELDS = (
     "brand",
     "manufacturer",
     "mpn",
+    "model",
+    "mark",
+    "series",
+    "seller_sku",
+    "technical_characteristics",
     "unit",
     "quantity",
     "price",
@@ -404,6 +409,19 @@ def evidence_bundle(record_id: str, normalized: dict, locator: dict, max_chars: 
         key: fields.get(key)
         for key in ("name", "brand", "mpn", "manufacturer", "unit", "category_path")
     }
+    selected.update(
+        {
+            key: fields[key]
+            for key in (
+                "model",
+                "mark",
+                "series",
+                "seller_sku",
+                "technical_characteristics",
+            )
+            if fields.get(key) is not None
+        }
+    )
     evidence = [
         {
             "evidence_id": f"raw_{key}",

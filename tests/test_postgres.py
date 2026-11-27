@@ -38,7 +38,7 @@ def test_migration_matches_models(db_engine):
     """Живая Alembic schema точно соответствует ORM metadata и readiness-контракту."""
     assert check_database(db_engine) == {
         "status": "ready",
-        "revision": "0005_product_identity",
+        "revision": "0006_identity_physical_merge",
         "categories": 0,
     }
     with db_engine.connect() as conn:
@@ -54,6 +54,36 @@ def test_migration_matches_models(db_engine):
             metadata,
         )
     assert differences == []
+
+
+@pytest.mark.parametrize("db_engine", ["0005_product_identity"], indirect=True)
+def test_identity_upgrade_preserves_legacy_redirect_rows(db_engine):
+    """Обновляет заполненную 0005 и сохраняет FK на цель при удалении исходного UUID."""
+    old, target = uuid4(), uuid4()
+    with db_engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                "INSERT INTO products (id, canonical_name, status) VALUES "
+                "(:old, 'Старый дубликат', 'retired'), (:target, 'Товар', 'provisional')"
+            ),
+            {"old": old, "target": target},
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO product_merge_redirects (old_product_id,product_id,evidence) "
+                "VALUES (:old,:target,'{}')"
+            ),
+            {"old": old, "target": target},
+        )
+    config = Config("alembic.ini")
+    config.attributes["engine"] = db_engine
+    command.upgrade(config, "head")
+    with db_engine.begin() as conn:
+        assert conn.scalar(sa.text("SELECT count(*) FROM products")) == 2
+        conn.execute(sa.text("DELETE FROM products WHERE id=:old"), {"old": old})
+        assert conn.scalar(sa.text("SELECT product_id FROM product_merge_redirects")) == target
+        with pytest.raises(sa.exc.IntegrityError), conn.begin_nested():
+            conn.execute(sa.text("DELETE FROM products WHERE id=:target"), {"target": target})
 
 
 def test_preview_apply_repeat_custom_and_report(db_engine, snapshot, review):

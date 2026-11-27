@@ -295,9 +295,10 @@ class SharedInference:
             answer["attributes"] = [
                 entry
                 for entry in answer["attributes"]
-                if "raw_name" in entry["evidence_ids"]
-                and any(
-                    literal(value, sources.get("raw_name", ""))
+                if any(
+                    literal(value, sources.get(ref, ""))
+                    for ref in {"raw_name", "raw_technical_characteristics"}
+                    & set(entry["evidence_ids"])
                     for value in (
                         entry["value"],
                         entry["value"] + (entry["unit"] or ""),

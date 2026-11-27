@@ -11,12 +11,17 @@ from sqlalchemy.dialects.postgresql import distinct_on, insert
 
 from app.domain.catalog import CatalogError, ConflictError, fingerprint, json_value
 from app.domain.product_identity import (
+    IDENTITY_LIMIT,
     accumulate_profile,
+    canonical_brand,
     claim_value,
+    decide_identity,
     identity_conflicts,
-    identity_key,
     identity_profile,
+    identity_retrieval_keys,
+    refine_legacy_roles,
     searchable_mpn,
+    text_key,
 )
 
 
@@ -34,6 +39,15 @@ class CatalogStore:
     def transaction(self) -> Iterator["CatalogSession"]:
         """Коммитит все изменения либо откатывает raw, результаты, счётчики и events вместе."""
         with self.engine.begin() as connection:
+            yield CatalogSession(connection, self.tables)
+
+    @contextmanager
+    def readonly(self) -> Iterator["CatalogSession"]:
+        """Читает один согласованный снимок, PostgreSQL запрещает запись в этой транзакции."""
+        with self.engine.begin() as connection:
+            connection.execute(
+                sa.text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            )
             yield CatalogSession(connection, self.tables)
 
     def categories(self) -> list[dict]:
@@ -1088,77 +1102,166 @@ class CatalogSession:
             .values(product_id=product_id, processing_version=items.c.processing_version + 1)
         )
 
-    def confirmed_product(self, fields: dict) -> dict | None:
-        """Совпадение MPN допустимо только с подтверждённым issuer, без конфликтов вариантов."""
-        from app.domain.catalog import identity_features, normalized_key
+    def confirmed_identity_candidates(self, profile: dict) -> list[tuple]:
+        """Возвращает ранее подтверждённые артикулы с точным исходным написанием."""
+        from app.domain.catalog import normalized_key
 
-        issuer = fields.get("manufacturer") or fields.get("brand")
-        if not issuer or not fields.get("mpn"):
-            return None
+        mpn = claim_value(profile, "mpn")
+        role = "brand" if claim_value(profile, "brand") else "manufacturer"
+        issuer = claim_value(profile, role)
+        if not issuer or not mpn:
+            return []
         identifiers, products = (self.table(n) for n in ("product_identifiers", "products"))
         query = (
-            sa.select(products)
+            sa.select(products, identifiers.c.raw_value.label("identifier_value"))
             .join(identifiers, products.c.id == identifiers.c.product_id)
             .where(
                 products.c.status == "identified",
                 identifiers.c.identifier_type == "MPN",
-                identifiers.c.normalized_value == normalized_key(fields["mpn"]),
+                identifiers.c.normalized_value == normalized_key(mpn),
                 identifiers.c.status == "confirmed",
                 identifiers.c.issuer == normalized_key(issuer),
             )
-            .limit(2)
+            .order_by(identifiers.c.product_id)
+            .limit(IDENTITY_LIMIT + 1)
         )
-        candidates = list(self.connection.execute(query).mappings())
-        if len(candidates) != 1:
-            return None
-        product = dict(candidates[0])
-        known = product["attributes"].get("identity_fields", {})
-        if any(fields.get(k) and known.get(k) != fields[k] for k in ("unit", "quantity")):
-            return None
-        given_features = identity_features(fields.get("name"))
-        known_features = identity_features(product["canonical_name"])
-        if any(known_features.get(key) != value for key, value in given_features.items()):
-            return None
-        existing = product["attributes"].get("identity_profile") or identity_profile(
-            {"name": product["canonical_name"], "mpn": product["mpn"]}
-        )
-        if identity_conflicts(existing, identity_profile(fields)):
-            return None
-        return product
+        result = []
+        for row in self.connection.execute(query).mappings():
+            product = dict(row)
+            if text_key(product.pop("identifier_value")) != text_key(mpn):
+                continue
+            anchor = identity_profile({"name": product["canonical_name"], role: issuer, "mpn": mpn})
+            known = self.product_profile(product)
+            if not identity_conflicts(known, anchor):
+                result.append((product, accumulate_profile(known, anchor)))
+        return result
 
-    def find_identity_product(self, profile: dict) -> dict | None:
-        """Сериализует один точный ключ и возвращает единственный совместимый Product."""
-        key = identity_key(profile)
-        if key is None:
-            return None
-        self.connection.execute(
-            sa.text("SELECT pg_advisory_xact_lock(hashtextextended(:key,0))"),
-            {"key": "product-identity:" + key},
+    def product_profile(self, product: dict) -> dict:
+        """Вычисляет профиль старой карточки без повышения доверия к гипотезам."""
+        attributes = product["attributes"]
+        stored = attributes.get("identity_profile")
+        if stored and stored.get("version") == 2:
+            return stored
+        from_answer = identity_profile(
+            {"name": product["canonical_name"]}, attributes.get("understanding")
         )
-        keys, products = self.table("product_identity_keys"), self.table("products")
+        return accumulate_profile(stored, from_answer) if stored else from_answer
+
+    def approved_brand_aliases(self, terms=None) -> dict[str, str]:
+        """Читает только алиасы, утверждённые для активной записи справочника."""
+        aliases, brands = (self.table(n) for n in ("brand_aliases", "brands"))
         query = (
-            sa.select(products)
-            .join(keys, products.c.id == keys.c.product_id)
-            .where(keys.c.identity_key == key, products.c.status != "retired")
-            .order_by(keys.c.product_id)
-            .limit(33)
-            .with_for_update(of=products)
+            sa.select(aliases.c.alias, brands.c.canonical_name)
+            .join(brands, brands.c.id == aliases.c.brand_id)
+            .where(aliases.c.status == "approved", brands.c.status == "approved")
         )
-        rows = list(self.connection.execute(query).mappings())
-        if len(rows) > 32:
+        if terms is not None:
+            terms = sorted({text_key(term) for term in terms if term})
+            if not terms:
+                return {}
+            query = query.where(aliases.c.normalized_alias.in_(terms))
+        return {text_key(row.alias): row.canonical_name for row in self.connection.execute(query)}
+
+    def reusable_product_classification(self, product_id) -> dict | None:
+        """Читает стабильное решение без категории при неизменном дереве."""
+        decisions = self.table("classification_decisions")
+        query = (
+            sa.select(decisions)
+            .where(
+                decisions.c.product_id == product_id,
+                decisions.c.method == "retrieval_vlm",
+                decisions.c.taxonomy_revision == self.taxonomy_revision(),
+            )
+            .order_by(decisions.c.created_at.desc(), decisions.c.id)
+            .limit(1)
+        )
+        row = self.connection.execute(query).mappings().first()
+        if (
+            row
+            and row["status"] in {"needs_review", "no_suitable_category"}
+            and row["evidence"].get("identity_reusable")
+        ):
+            return dict(row)
+        return None
+
+    def confirmed_product(self, fields: dict) -> dict | None:
+        """Поддерживает строгий поиск legacy-реквизитов через общую проверку профиля."""
+        row, _ = self.find_identity_product(identity_profile(fields), structured_only=True)
+        known = row["attributes"].get("identity_fields", {}) if row else {}
+        if known.get("quantity") and fields.get("unit") and fields["unit"] != known.get("unit"):
             return None
-        compatible = [
-            dict(row)
-            for row in rows
-            if not identity_conflicts(row["attributes"]["identity_profile"], profile)
-        ]
-        return compatible[0] if len(compatible) == 1 else None
+        return row
+
+    def find_identity_product(
+        self, profile: dict, excluded=(), *, structured_only: bool = False
+    ) -> tuple[dict | None, dict]:
+        """Захватывает ограниченные поисковые ключи до чтения и записи карточки."""
+        lookup = identity_retrieval_keys(profile)
+        if lookup:
+            self.connection.execute(
+                sa.text("""SELECT pg_advisory_xact_lock(lock_id) FROM (
+                  SELECT DISTINCT hashtextextended('product-identity:' || key, 0) AS lock_id
+                  FROM unnest(CAST(:keys AS text[])) AS items(key) ORDER BY lock_id
+                ) AS ordered"""),
+                {"keys": lookup},
+            )
+        products = self.table("products")
+        candidates = {
+            p["id"]: (p, facts) for p, facts in self.confirmed_identity_candidates(profile)
+        }
+        if lookup and not structured_only:
+            ids = (
+                self.connection.execute(
+                    sa.text("""SELECT DISTINCT found.product_id
+                  FROM unnest(CAST(:keys AS text[])) terms(key)
+                  CROSS JOIN LATERAL (
+                    SELECT k.product_id FROM product_identity_keys k
+                    JOIN products p ON p.id=k.product_id AND p.status <> 'retired'
+                    WHERE k.identity_key=terms.key ORDER BY k.product_id LIMIT :limit
+                  ) found ORDER BY found.product_id LIMIT :limit"""),
+                    {"keys": lookup, "limit": IDENTITY_LIMIT + 1},
+                )
+                .scalars()
+                .all()
+            )
+            query = sa.select(products).where(products.c.id.in_(ids)).order_by(products.c.id)
+            for row in self.connection.execute(query).mappings():
+                product = dict(row)
+                candidates.setdefault(product["id"], (product, self.product_profile(product)))
+        for pid in excluded:
+            candidates.pop(pid, None)
+        aliases = (
+            self.approved_brand_aliases(
+                [claim_value(facts, "brand") for _, facts in candidates.values()]
+                + [claim_value(profile, "brand")]
+            )
+            if candidates
+            else {}
+        )
+        decision = decide_identity(
+            canonical_brand(profile, aliases),
+            [
+                (pid, canonical_brand(facts, aliases))
+                for pid, (_, facts) in list(candidates.items())[:IDENTITY_LIMIT]
+            ],
+            overflow=len(candidates) > IDENTITY_LIMIT,
+        )
+        selected = decision.pop("product_id")
+        return candidates[selected][0] if selected else None, decision
 
     def remember_identity(self, product_id, profile: dict) -> None:
         """Пишет исходные факты в пустые поля и актуализирует индекс Product."""
         product = self.get("products", product_id, lock=True)
         attributes = product["attributes"]
         previous = attributes.get("identity_profile")
+        corrected = set()
+        if product["status"] != "identified" and any(
+            claim.get("evidence") == "verified_document" for claim in profile["claims"].values()
+        ):
+            previous = previous or self.product_profile(product)
+            refined = refine_legacy_roles(previous, profile)
+            corrected = previous["claims"].keys() - refined["claims"].keys()
+            previous = refined
         if previous and identity_conflicts(previous, profile):
             return
         if previous:
@@ -1167,23 +1270,27 @@ class CatalogSession:
         if attributes.get("identity_profile") != profile:
             updates["attributes"] = {**attributes, "identity_profile": profile}
         for field, directory in (("brand", "brands"), ("manufacturer", "manufacturers")):
-            if not product[f"{field}_id"] and (value := claim_value(profile, field)):
+            if (not product[f"{field}_id"] or field in corrected) and (
+                value := claim_value(profile, field)
+            ):
                 updates[f"{field}_id"] = self.directory_candidate(directory, value)
-        if not product["mpn"] and (mpn := claim_value(profile, "mpn")):
+        if (not product["mpn"] or "mpn" in corrected) and (mpn := claim_value(profile, "mpn")):
             updates.update(mpn=mpn, normalized_mpn=searchable_mpn(profile))
         if not product["model"] and (model := claim_value(profile, "model")):
             updates["model"] = model
         if updates:
             self.update("products", product_id, **updates)
-        key = identity_key(profile)
-        previous_key = identity_key(previous) if previous else None
         keys = self.table("product_identity_keys")
-        if previous_key and previous_key != key:
-            self.connection.execute(keys.delete().where(keys.c.product_id == product["id"]))
-        if key:
+        desired = identity_retrieval_keys(profile)
+        self.connection.execute(
+            keys.delete().where(
+                keys.c.product_id == product["id"], keys.c.identity_key.not_in(desired)
+            )
+        )
+        if desired:
             self.connection.execute(
                 insert(keys)
-                .values(identity_key=key, product_id=product["id"])
+                .values([{"identity_key": key, "product_id": product["id"]} for key in desired])
                 .on_conflict_do_nothing()
             )
 
@@ -1201,10 +1308,38 @@ class CatalogSession:
             )
         )
         links = (
-            sa.select(items.c.product_id, items.c.normalized_record_id)
+            sa.select(
+                items.c.product_id,
+                items.c.normalized_record_id,
+                items.c.raw_record_id,
+                items.c.status,
+            )
             .where(items.c.product_id.is_not(None), items.c.normalized_record_id.is_not(None))
             .distinct()
             .subquery()
+        )
+        raw, obs, offers, sellers, categories = (
+            self.table(name)
+            for name in ("raw_records", "price_observations", "offers", "sellers", "categories")
+        )
+        decisions = self.table("classification_decisions")
+        category_weight = (
+            sa.select(
+                sa.func.max(
+                    sa.case(
+                        (decisions.c.method.in_(["approved_rule", "approved_mapping"]), 2),
+                        (decisions.c.method == "retrieval_vlm", 1),
+                        else_=0,
+                    )
+                )
+            )
+            .where(
+                decisions.c.product_id == p.c.id,
+                decisions.c.category_id == p.c.category_id,
+                decisions.c.status == "approved",
+            )
+            .correlate(p)
+            .scalar_subquery()
         )
         understanding = (
             sa.select(answers.c.answer_json)
@@ -1222,9 +1357,11 @@ class CatalogSession:
             sa.select(
                 p.c.id.label("product_id"),
                 p.c.canonical_name,
+                p.c.status.label("product_status"),
                 p.c.created_at,
                 p.c.updated_at,
-                p.c.category_id,
+                categories.c.id.label("category_id"),
+                sa.func.coalesce(category_weight, 0).label("category_weight"),
                 p.c.mpn,
                 p.c.model,
                 p.c.unit_code,
@@ -1234,9 +1371,27 @@ class CatalogSession:
                 understanding.c.answer_json.label("answer"),
                 brands.c.canonical_name.label("brand_name"),
                 makers.c.legal_name.label("manufacturer_name"),
+                raw.c.id.label("raw_id"),
+                raw.c.origin_url,
+                links.c.status.label("item_status"),
+                offers.c.id.label("offer_id"),
+                sellers.c.id.label("seller_id"),
+                sellers.c.legal_name.label("seller_name"),
             )
             .outerjoin(links, links.c.product_id == p.c.id)
             .outerjoin(n, n.c.id == links.c.normalized_record_id)
+            .outerjoin(raw, raw.c.id == links.c.raw_record_id)
+            .outerjoin(obs, obs.c.raw_record_id == raw.c.id)
+            .outerjoin(offers, offers.c.id == obs.c.offer_id)
+            .outerjoin(sellers, sellers.c.id == offers.c.seller_id)
+            .outerjoin(
+                categories,
+                sa.and_(
+                    categories.c.id == p.c.category_id,
+                    categories.c.is_active,
+                    categories.c.is_assignable,
+                ),
+            )
             .outerjoin(understanding, sa.true())
             .outerjoin(
                 brands,
@@ -1252,7 +1407,7 @@ class CatalogSession:
                 ),
             )
             .where(p.c.status != "retired")
-            .order_by(p.c.created_at, p.c.id, n.c.id)
+            .order_by(p.c.created_at, p.c.id, n.c.id, raw.c.id, offers.c.id)
         )
         return [dict(r) for r in self.connection.execute(query).mappings()]
 
@@ -1271,19 +1426,146 @@ class CatalogSession:
             .outerjoin(items, c.c.normalized_record_id == items.c.normalized_record_id)
             .where(c.c.method == "manual", c.c.status == "approved")
         )
-        denied = sa.select(
-            m.c.product_id,
+        latest_match = (
+            sa.select(m.c.product_id, m.c.status, m.c.normalized_record_id)
+            .where(m.c.stage == "manual")
+            .ext(distinct_on(m.c.normalized_record_id, m.c.product_id))
+            .order_by(m.c.normalized_record_id, m.c.product_id, m.c.created_at.desc(), m.c.id)
+            .subquery()
+        )
+        denied_target = sa.select(
+            latest_match.c.product_id,
             sa.cast(sa.null(), sa.Uuid).label("category_id"),
             sa.true().label("blocked"),
-        ).where(m.c.stage == "manual", m.c.status == "rejected")
-        return [dict(r) for r in self.connection.execute(categories.union(denied)).mappings()]
+        ).where(latest_match.c.status == "rejected")
+        denied_source = (
+            sa.select(
+                items.c.product_id,
+                sa.cast(sa.null(), sa.Uuid).label("category_id"),
+                sa.true().label("blocked"),
+            )
+            .join(latest_match, latest_match.c.normalized_record_id == items.c.normalized_record_id)
+            .where(latest_match.c.status == "rejected", items.c.product_id.is_not(None))
+        )
+        query = categories.union(denied_target, denied_source)
+        return [dict(r) for r in self.connection.execute(query).mappings()]
+
+    def unlinked_identity_rows(self) -> list[dict]:
+        """Читает только проверенные оператором или завершённые позиции без Product."""
+        items, raw, normalized, answers, matches, decisions, obs, offers = (
+            self.table(name)
+            for name in (
+                "ingest_job_items",
+                "raw_records",
+                "normalized_records",
+                "product_understandings",
+                "product_match_decisions",
+                "classification_decisions",
+                "price_observations",
+                "offers",
+            )
+        )
+        answer = (
+            sa.select(answers.c.answer_json)
+            .where(
+                answers.c.normalized_record_id == normalized.c.id,
+                answers.c.status.in_(["recognized", "insufficient_evidence"]),
+                answers.c.answer_json.is_not(None),
+                ~answers.c.model_revision.startswith("mock"),
+            )
+            .order_by(answers.c.created_at.desc(), answers.c.id)
+            .limit(1)
+            .lateral()
+        )
+        query = (
+            sa.select(
+                items.c.id,
+                items.c.raw_record_id,
+                items.c.normalized_record_id,
+                items.c.status,
+                items.c.category_id,
+                items.c.processing_version,
+                raw.c.origin_url,
+                normalized.c.attributes["fields"].label("fields"),
+                answer.c.answer_json.label("answer"),
+                offers.c.id.label("offer_id"),
+            )
+            .join(raw, items.c.raw_record_id == raw.c.id)
+            .join(normalized, normalized.c.id == items.c.normalized_record_id)
+            .join(obs, obs.c.raw_record_id == raw.c.id)
+            .join(offers, obs.c.offer_id == offers.c.id)
+            .join(answer, sa.true())
+            .where(
+                items.c.product_id.is_(None),
+                offers.c.product_id.is_(None),
+                items.c.status.in_(["assigned", "needs_review"]),
+                ~sa.exists().where(
+                    matches.c.normalized_record_id == normalized.c.id, matches.c.stage == "manual"
+                ),
+                ~sa.exists().where(
+                    decisions.c.normalized_record_id == normalized.c.id,
+                    decisions.c.method == "manual",
+                    decisions.c.status == "approved",
+                ),
+            )
+            .order_by(items.c.id, offers.c.id)
+        )
+        return [dict(row) for row in self.connection.execute(query).mappings()]
+
+    def attach_merged_source(self, match: dict) -> None:
+        """Восстанавливает связь исходника, сохраняя рабочий статус и решения о категории."""
+        target = UUID(match["product_id"])
+        self.update(
+            "ingest_job_items",
+            match["id"],
+            product_id=target,
+            processing_version=match["processing_version"] + 1,
+        )
+        offers = self.table("offers")
+        updated = self.connection.execute(
+            offers.update()
+            .where(
+                offers.c.id == UUID(match["offer_id"]),
+                offers.c.product_id.is_(None),
+                offers.c.status != "retired",
+            )
+            .values(product_id=target)
+        ).rowcount
+        if updated != 1:
+            raise ConflictError("Предложение исходной позиции изменилось после preview")
+        self.add(
+            "product_match_decisions",
+            normalized_record_id=UUID(match["normalized_record_id"]),
+            product_id=target,
+            stage="after_understanding",
+            method="verified_saved_source",
+            status="confirmed",
+            evidence={"proof": match["proof"]},
+        )
+
+    def product_merge_aliases(self) -> list[dict]:
+        """Предлагает очистить только retired с действующим ранее записанным редиректом."""
+        aliases, products = (self.table(n) for n in ("product_merge_redirects", "products"))
+        target = products.alias("live")
+        query = (
+            sa.select(
+                aliases.c.old_product_id,
+                aliases.c.product_id,
+                aliases.c.evidence,
+                products.c.updated_at,
+                target.c.updated_at.label("target_updated_at"),
+            )
+            .join(products, aliases.c.old_product_id == products.c.id)
+            .join(target, aliases.c.product_id == target.c.id)
+            .where(products.c.status == "retired", target.c.status != "retired")
+            .order_by(aliases.c.old_product_id)
+        )
+        return json_value([dict(row) for row in self.connection.execute(query).mappings()])
 
     def lock_product_merge(self) -> None:
         """Блокирует запуск новых заданий и изменения Product на время короткой операции."""
         self.freeze_taxonomy()
-        self.connection.execute(
-            sa.text("LOCK TABLE products, ingest_jobs IN SHARE ROW EXCLUSIVE MODE")
-        )
+        self.connection.execute(sa.text("LOCK TABLE ingest_jobs IN SHARE ROW EXCLUSIVE MODE"))
         jobs = self.table("ingest_jobs")
         if self.connection.scalar(
             sa.select(
@@ -1293,14 +1575,35 @@ class CatalogSession:
             )
         ):
             raise ConflictError("Дождитесь остановки или завершения всех активных заданий")
+        self.connection.execute(
+            sa.text("""LOCK TABLE products, ingest_job_items,
+            offers, product_identifiers, product_identity_keys, product_merge_redirects,
+            product_match_decisions, classification_decisions, review_tasks, taxonomy_gaps
+            IN SHARE ROW EXCLUSIVE MODE NOWAIT""")
+        )
 
     def merge_integrity(self) -> dict:
         """Фиксирует число исходников, предложений, цен и неизменяемый прогресс заданий."""
         counts = self.catalog_counts()
         counts.pop("products")
+        counts.pop("products_with_category")
         jobs = self.table("ingest_jobs")
         return {
             **counts,
+            "sellers": self.connection.scalar(
+                sa.select(sa.func.count()).select_from(self.table("sellers"))
+            ),
+            "sha256": {
+                name: self.merge_digest(name, ("product_id",) if name == "offers" else ())
+                for name in (
+                    "raw_records",
+                    "normalized_records",
+                    "product_understandings",
+                    "offers",
+                    "price_observations",
+                    "price_history",
+                )
+            },
             "jobs": json_value(
                 [
                     dict(row)
@@ -1318,13 +1621,64 @@ class CatalogSession:
             ),
         }
 
+    def merge_digest(self, table: str, excluded: tuple = ()) -> str:
+        """Сверяет множества UUID и все сохраняемые значения без выгрузки строк."""
+        rows = self.table(table)
+        body = sa.func.to_jsonb(rows.table_valued())
+        if excluded:
+            body = body.op("-")(sa.cast(list(excluded), sa.ARRAY(sa.Text)))
+        row_hash = sa.func.sha256(sa.func.convert_to(sa.cast(body, sa.Text), "UTF8"))
+        ordered = sa.func.aggregate_strings(sa.func.encode(row_hash, "hex"), "").aggregate_order_by(
+            *rows.primary_key.columns
+        )
+        hashed = sa.func.sha256(sa.func.convert_to(sa.func.coalesce(ordered, ""), "UTF8"))
+        return self.connection.scalar(sa.select(sa.func.encode(hashed, "hex")).select_from(rows))
+
+    def merge_offer_routes(self, mapping: dict, attachments: dict | None = None) -> str:
+        """Хеширует будущие либо текущие связи предложений с Product по UUID."""
+        query = sa.text("""SELECT encode(sha256(convert_to(coalesce(string_agg(
+            id::text || ':' || coalesce(CAST(:attachments AS jsonb)->>id::text,
+                                        CAST(:mapping AS jsonb)->>product_id::text,
+                                        product_id::text, '-'),
+            ',' ORDER BY id), ''), 'UTF8')), 'hex') FROM offers""")
+        import json
+
+        return self.connection.scalar(
+            query, {"mapping": json.dumps(mapping), "attachments": json.dumps(attachments or {})}
+        )
+
+    def merge_candidate_routes(self, mapping: dict) -> None:
+        """Переносит оперативные ссылки кандидатов и оставляет прежние UUID в аудите."""
+        if not mapping:
+            return
+        decisions = self.table("product_match_decisions")
+        query = sa.select(
+            decisions.c.id, decisions.c.candidate_product_ids, decisions.c.evidence
+        ).where(
+            decisions.c.candidate_product_ids.op("?|")(sa.cast(list(mapping), sa.ARRAY(sa.Text)))
+        )
+        for row in self.connection.execute(query).mappings():
+            candidates = row["candidate_product_ids"]
+            evidence = row["evidence"]
+            history = evidence.get("merge_candidate_ids_before", [])
+            self.update(
+                "product_match_decisions",
+                row["id"],
+                candidate_product_ids=list(
+                    dict.fromkeys(mapping.get(pid, pid) for pid in candidates)
+                ),
+                evidence={**evidence, "merge_candidate_ids_before": [*history, candidates]},
+            )
+
     def merge_products(self, group: dict) -> dict[str, int]:
         """Переносит связанные записи, сохраняет старые UUID как aliases и аудирует перенос."""
         target = UUID(group["survivor"])
         absorbed = [UUID(key) for key in group["duplicates"]]
-        if group["category_id"]:
-            self.update("products", target, category_id=UUID(group["category_id"]))
-        self.remember_identity(target, group["profile"])
+        category = group.get("category_id")
+        if category:
+            self.update("products", target, category_id=UUID(category))
+        if group.get("profile"):
+            self.remember_identity(target, group["profile"])
         moved = {}
         for table in (
             "offers",
@@ -1341,46 +1695,89 @@ class CatalogSession:
             moved[table] = self.connection.execute(
                 ref.update().where(ref.c.product_id.in_(absorbed)).values(**values)
             ).rowcount
+        if category:
+            items = self.table("ingest_job_items")
+            self.connection.execute(
+                items.update()
+                .where(
+                    items.c.product_id == target,
+                    items.c.status == "assigned",
+                    items.c.category_id.is_distinct_from(UUID(category)),
+                )
+                .values(
+                    category_id=UUID(category), processing_version=items.c.processing_version + 1
+                )
+            )
         identifiers = self.table("product_identifiers")
+        identifier_evidence = {}
         for item in self.connection.execute(
             sa.select(identifiers)
             .where(identifiers.c.product_id.in_(absorbed))
             .order_by(identifiers.c.created_at, identifiers.c.id)
         ).mappings():
-            duplicate = self.connection.scalar(
-                sa.select(identifiers.c.id).where(
-                    identifiers.c.product_id == target,
-                    identifiers.c.identifier_type == item["identifier_type"],
-                    identifiers.c.issuer.is_not_distinct_from(item["issuer"]),
-                    identifiers.c.normalized_value == item["normalized_value"],
+            duplicate = (
+                self.connection.execute(
+                    sa.select(identifiers).where(
+                        identifiers.c.product_id == target,
+                        identifiers.c.identifier_type == item["identifier_type"],
+                        identifiers.c.issuer.is_not_distinct_from(item["issuer"]),
+                        identifiers.c.normalized_value == item["normalized_value"],
+                    )
                 )
+                .mappings()
+                .first()
             )
             if duplicate is None:
                 self.update("product_identifiers", item["id"], product_id=target)
+            else:
+                statuses = {item["status"], duplicate["status"]}
+                if statuses == {"rejected", "confirmed"}:
+                    raise ConflictError("Противоречащие ручные решения по идентификатору")
+                identifier_evidence.setdefault(str(item["product_id"]), []).append(
+                    json_value(dict(item))
+                )
+                if duplicate["status"] == "candidate" and item["status"] != "candidate":
+                    self.update("product_identifiers", duplicate["id"], status=item["status"])
+                self.connection.execute(identifiers.delete().where(identifiers.c.id == item["id"]))
         redirects = self.table("product_merge_redirects")
         self.connection.execute(
             redirects.update().where(redirects.c.product_id.in_(absorbed)).values(product_id=target)
         )
-        self.connection.execute(
-            redirects.insert().values(
-                [
-                    {
-                        "old_product_id": key,
-                        "product_id": target,
-                        "evidence": {"identity_key": group["key"], "profile": group["profile"]},
-                    }
-                    for key in absorbed
-                ]
+        if not group.get("legacy"):
+            self.connection.execute(
+                redirects.insert().values(
+                    [
+                        {
+                            "old_product_id": key,
+                            "product_id": target,
+                            "evidence": {
+                                "identity_key": group["key"],
+                                "proofs": group["proofs"],
+                                "collapsed_identifiers": identifier_evidence.get(str(key), []),
+                            },
+                        }
+                        for key in absorbed
+                    ]
+                )
             )
-        )
+        elif identifier_evidence:
+            self.connection.execute(
+                redirects.update()
+                .where(redirects.c.old_product_id == absorbed[0])
+                .values(
+                    evidence=redirects.c.evidence.op("||")(
+                        {"collapsed_identifiers": identifier_evidence[str(absorbed[0])]}
+                    ),
+                )
+            )
         keys = self.table("product_identity_keys")
         self.connection.execute(keys.delete().where(keys.c.product_id.in_(absorbed)))
         products = self.table("products")
-        self.connection.execute(
-            products.update()
-            .where(products.c.id.in_(absorbed))
-            .values(status="retired", updated_at=datetime.now(UTC))
-        )
+        deleted = self.connection.execute(
+            products.delete().where(products.c.id.in_(absorbed))
+        ).rowcount
+        if deleted != len(absorbed):
+            raise ConflictError("Число удаляемых карточек изменилось после preview")
         return moved
 
     def category_references(self, category_id) -> dict:

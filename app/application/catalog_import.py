@@ -41,7 +41,7 @@ from app.domain.catalog import (
     normalized_key,
     raw_type_understanding,
 )
-from app.domain.product_identity import claim_value, identity_profile
+from app.domain.product_identity import identity_key, identity_profile
 
 
 class CatalogImport:
@@ -531,14 +531,18 @@ class CatalogImport:
         reclassify = "reclassify_requested" in item["issue_codes"]
         with self.store.transaction() as unit:
             norm = unit.get("normalized_records", item["normalized_record_id"])
-            fields = norm["attributes"]["fields"]
+            raw = unit.get("raw_records", item["raw_record_id"])
+            fields = {**norm["attributes"]["fields"], "origin_url": raw["origin_url"]}
             decisions = unit.all("classification_decisions", normalized_record_id=norm["id"])
             manual = [d for d in decisions if d["status"] == "approved" and d["method"] == "manual"]
             matches = unit.all("product_match_decisions", normalized_record_id=norm["id"])
             manual_matches = sorted(
                 [m for m in matches if m["stage"] == "manual"], key=lambda m: m["created_at"]
             )
-            rejected_ids = {m["product_id"] for m in manual_matches if m["status"] == "rejected"}
+            manual_by_product = {m["product_id"]: m["status"] for m in manual_matches}
+            rejected_ids = {
+                pid for pid, status in manual_by_product.items() if status == "rejected"
+            }
             if manual:
                 decision = max(manual, key=lambda d: d["created_at"])
                 manual_action = decision["evidence"].get("manual_action")
@@ -573,14 +577,18 @@ class CatalogImport:
                     linked_product,
                 )
                 return
-            if reclassify:
-                product = unit.get("products", item["product_id"]) if item["product_id"] else None
-            else:
-                product = unit.confirmed_product(fields)
+            product = unit.get("products", item["product_id"]) if item["product_id"] else None
+            fast_evidence = {"decision": "same", "reason": "existing_record"}
             if product and product["id"] in rejected_ids:
                 product = None
             if manual_matches and manual_matches[-1]["status"] == "confirmed":
                 product = unit.get("products", manual_matches[-1]["product_id"])
+                fast_evidence["reason"] = "manual_decision"
+            if not product and not reclassify and None not in rejected_ids:
+                fast_profile = identity_profile(fields)
+                if identity_key(fast_profile):
+                    unit.freeze_taxonomy()
+                    product, fast_evidence = unit.find_identity_product(fast_profile, rejected_ids)
             if product and not reclassify:
                 unit.freeze_taxonomy()
                 unit.add(
@@ -588,9 +596,11 @@ class CatalogImport:
                     normalized_record_id=norm["id"],
                     product_id=product["id"],
                     stage="fast_identifiers",
-                    method="confirmed_issuer_mpn",
+                    method="confirmed_issuer_mpn"
+                    if fast_evidence.get("candidates")
+                    else "existing_record",
                     status="confirmed",
-                    evidence={"issuer": fields.get("manufacturer") or fields.get("brand")},
+                    evidence={"identity": fast_evidence},
                 )
         product_id = product["id"] if product else None
         if self.assign_existing(
@@ -605,7 +615,7 @@ class CatalogImport:
             if answer is None:
                 raise
             usage["understanding_origin"] = "raw_name"
-        if reclassify:
+        if reclassify and product:
             self.classify_saved(item, norm, product, answer, usage)
             return
         if (
@@ -642,19 +652,28 @@ class CatalogImport:
                 and d["product_id"] not in rejected_ids
             ]
             method = "existing_record"
+            identity = {"decision": "same", "reason": "existing_record", "candidates": []}
             if not product and previous:
                 saved = max(previous, key=lambda d: d["created_at"])
                 product = unit.get("products", saved["product_id"])
-            if not product:
-                lookup = {
-                    **fields,
-                    **{key: claim_value(profile, key) for key in ("brand", "manufacturer", "mpn")},
-                }
-                product = unit.confirmed_product(lookup) or unit.find_identity_product(profile)
-                if product and product["id"] in rejected_ids:
-                    product = None
+            if not product and None not in rejected_ids:
+                product, identity = unit.find_identity_product(profile, rejected_ids)
                 method = "source_identity"
+            elif not product:
+                identity = {"decision": "uncertain", "reason": "manual_rejection", "candidates": []}
             if product and self.keep_archived_product(unit, item, product["id"]):
+                return
+            if not product and identity.get("reason") == "multiple_proven":
+                unit.add(
+                    "product_match_decisions",
+                    normalized_record_id=norm["id"],
+                    stage="after_understanding",
+                    method="existing_duplicate_candidates",
+                    status="unresolved",
+                    evidence={"answer_1": answer, "identity": identity},
+                    candidate_product_ids=[entry["product_id"] for entry in identity["candidates"]],
+                )
+                self.finish_item(unit, item, "needs_review")
                 return
             reused = product is not None
             if product is None:
@@ -668,11 +687,13 @@ class CatalogImport:
                 stage="after_understanding",
                 method=method if reused else "new_provisional_no_identity_merge",
                 status="confirmed" if reused else "candidate",
-                evidence={"answer_1": answer},
+                candidate_product_ids=[entry["product_id"] for entry in identity["candidates"]],
+                evidence={"answer_1": answer, "identity": identity},
             )
             unit.update("ingest_job_items", item["id"], product_id=product["id"])
             unit.attach_offer(item["raw_record_id"], product["id"])
-        self.classify_saved(item, norm, product, answer, usage)
+        with self.store.record_lock(f"classification:{product['id']}"):
+            self.classify_saved(item, norm, product, answer, usage)
 
     def understand(self, item: dict, norm: dict, usage: dict, saved: bool = False) -> dict:
         """Повторно использует валидный answer_1 и хранит технические попытки отдельно."""
@@ -777,6 +798,12 @@ class CatalogImport:
             return
         if self.assign_existing(item, norm, product_id, fields, answer):
             return
+        if product_id and "reclassify_requested" not in item["issue_codes"]:
+            with self.store.transaction() as unit:
+                saved_category = unit.reusable_product_classification(product_id)
+                if saved_category:
+                    self.inherit_unresolved_category(unit, item, saved_category)
+                    return
         self.stage(item, "classifying")
         with self.store.transaction() as unit:
             unit.event(
@@ -845,6 +872,7 @@ class CatalogImport:
                 "strategy": result.strategy,
                 "reason": result.reason,
                 "model_logical_id": result.provenance.get("model_logical_id"),
+                "identity_reusable": not result.technical_failure,
             }
             provenance = {
                 "prompt_sha256": result.provenance.get("prompt_sha256"),
@@ -1147,6 +1175,36 @@ class CatalogImport:
             level="warning",
         )
 
+    def inherit_unresolved_category(self, unit, item: dict, previous: dict) -> None:
+        """Переиспользует кандидатов прежней классификации того же изделия."""
+        product_id = previous["product_id"]
+        copied = {
+            field: previous[field]
+            for field in (
+                "status",
+                "selection_type",
+                "candidates",
+                "prompt_sha256",
+                "model_revision",
+                "embedding_model_revision",
+                "taxonomy_revision",
+            )
+        }
+        unit.add(
+            "classification_decisions",
+            product_id=product_id,
+            normalized_record_id=item["normalized_record_id"],
+            method="existing_product",
+            evidence={**previous["evidence"], "inherited_decision_id": str(previous["id"])},
+            **copied,
+        )
+        self.finish_item(
+            unit,
+            item,
+            "needs_review" if previous["status"] == "needs_review" else "taxonomy_gap",
+            product_id=product_id,
+        )
+
     def finish_item(self, unit, item: dict, status: str, category_id=None, product_id=None) -> None:
         """Коммитит результат позиции и event вместе со счётчиками."""
         if status == "assigned" and (product_id is None or category_id is None):
@@ -1397,6 +1455,15 @@ class CatalogImport:
                 "method",
                 "status",
             )
+            identity_matches = unit.related(
+                "product_match_decisions",
+                "normalized_record_id",
+                norm_ids,
+                "normalized_record_id",
+                "created_at",
+                "evidence",
+                "candidate_product_ids",
+            )
             tasks = unit.related(
                 "review_tasks", "normalized_record_id", norm_ids, "normalized_record_id", "id"
             )
@@ -1412,6 +1479,14 @@ class CatalogImport:
         task_ids = defaultdict(list)
         for task in tasks:
             task_ids[task["normalized_record_id"]].append(task["id"])
+        identities = {}
+        for row in sorted(identity_matches, key=lambda match: match["created_at"]):
+            if identity := row["evidence"].get("identity"):
+                identities[row["normalized_record_id"]] = {
+                    "decision": identity["decision"],
+                    "reason": identity.get("reason"),
+                    "candidate_product_ids": row["candidate_product_ids"],
+                }
         for row in rows:
             key = row["normalized_record_id"]
             norm = normalized.get(key, {})
@@ -1424,6 +1499,7 @@ class CatalogImport:
                 category_path=categories.get(str(row["category_id"]), {}).get("path_names"),
                 decision_method=last["method"] if last else None,
                 decision_status=last["status"] if last else None,
+                identity=identities.get(key),
                 review_task_ids=task_ids[key],
             )
         return json_value(

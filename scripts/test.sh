@@ -10,8 +10,28 @@ if [[ "$mode" == '--live' || "$mode" == '--classification-live' ]]; then
     test -f examples/aitim_200_raw.json && test -f data/fixtures/categories_fixture.dump || { echo 'LIVE требует AITIM-200 и approved fixture dump'; exit 1; }
     docker network inspect ai-shared >/dev/null
     dc=(docker compose -p product-search-engine-live-tests -f compose.test.yaml -f compose.live-test.yaml)
+elif [[ "$mode" == '--identity-load' ]]; then
+    test -r .env || { echo 'Для AMQP нужен .env существующего проекта'; exit 1; }
+    docker network inspect ai-shared >/dev/null
+    suffix="$(tr -d '-' < /proc/sys/kernel/random/uuid)"
+    overlay=".tmp/temp/identity-load-$suffix.yaml"
+    cat > "$overlay" <<YAML
+services:
+  tests:
+    env_file: [./.env]
+    environment:
+      JOB_TRANSPORT: rabbitmq
+      CATALOG_IDENTITY_LOAD_TEST: '1'
+      RABBITMQ_QUEUE: product-search-engine.identity-test.$suffix
+    networks: [test, shared]
+networks:
+  shared:
+    external: true
+    name: ai-shared
+YAML
+    dc=(docker compose -p "product-search-engine-identity-$suffix" -f compose.test.yaml -f "$overlay")
 elif [[ $# -gt 0 && "$mode" != '--catalog-load' ]]; then
-    echo 'Используйте bash scripts/test.sh [--live|--classification-live|--catalog-load]' >&2; exit 1
+    echo 'Используйте bash scripts/test.sh [--live|--classification-live|--catalog-load|--identity-load]' >&2; exit 1
 fi
 cleanup() {
     # Удаляются только временные контейнеры этого test project; volumes не используются.
@@ -29,6 +49,8 @@ elif [[ "$mode" == '--live' ]]; then
     "${dc[@]}" run --rm --no-deps tests -m pytest tests/test_catalog_live.py tests/test_catalog_browser.py::test_aitim200_browser_sql_qdrant --junitxml=.tmp/reports/pytest-live-browser.xml -ra
 elif [[ "$mode" == '--catalog-load' ]]; then
     "${dc[@]}" run --rm --no-deps -e CATALOG_LOAD_TEST=1 tests -m pytest tests/test_catalog_load.py -s -ra
+elif [[ "$mode" == '--identity-load' ]]; then
+    "${dc[@]}" run --rm --no-deps tests -m pytest tests/test_catalog_load.py::test_identity_25000_rows -s -ra
 else
     "${dc[@]}" run --rm --no-deps tests
 fi

@@ -3,9 +3,9 @@
 .git
 .env
 .tmp
-examples
+# examples
 data
-renders
+# renders
 .idea
 **/__pycache__
 *.log
