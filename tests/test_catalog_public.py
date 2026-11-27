@@ -45,7 +45,7 @@ def test_public_catalog_contract_and_candidate_directories(catalog, tmp_path):
             tmp_path,
             [
                 {
-                    "name": "Кабель первый",
+                    "name": "Кабель первый 220В",
                     "mpn": "KT-01",
                     "brand": "Marca",
                     "manufacturer": "Завод А",
@@ -57,7 +57,7 @@ def test_public_catalog_contract_and_candidate_directories(catalog, tmp_path):
                     "unit": "м",
                 },
                 {
-                    "name": "Кабель второй",
+                    "name": "Кабель второй 380В",
                     "mpn": "KT-01",
                     "brand": "marca",
                     "manufacturer": "завод а",

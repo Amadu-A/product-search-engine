@@ -101,6 +101,42 @@
     },
     "reason": {
       "type": "string"
+    },
+    "identifiers": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "brand": {
+          "$ref": "#/$defs/claim"
+        },
+        "manufacturer": {
+          "$ref": "#/$defs/claim"
+        },
+        "mpn": {
+          "$ref": "#/$defs/claim"
+        },
+        "model": {
+          "$ref": "#/$defs/claim"
+        },
+        "mark": {
+          "$ref": "#/$defs/claim"
+        },
+        "series": {
+          "$ref": "#/$defs/claim"
+        },
+        "seller_code": {
+          "$ref": "#/$defs/claim"
+        }
+      },
+      "required": [
+        "brand",
+        "manufacturer",
+        "mpn",
+        "model",
+        "mark",
+        "series",
+        "seller_code"
+      ]
     }
   },
   "required": [
@@ -115,9 +151,48 @@
     "mpn_candidate",
     "attributes",
     "evidence_ids",
-    "reason"
+    "reason",
+    "identifiers"
   ],
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:product-search:answer-1:v1",
-  "title": "ProductUnderstandingAnswerV1"
+  "$id": "urn:product-search:answer-1:v2",
+  "title": "ProductUnderstandingAnswerV1",
+  "$defs": {
+    "claim": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "value": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "origin": {
+              "enum": [
+                "source",
+                "inferred"
+              ]
+            },
+            "evidence_ids": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 12
+            }
+          },
+          "required": [
+            "value",
+            "origin",
+            "evidence_ids"
+          ]
+        }
+      ]
+    }
+  }
 }

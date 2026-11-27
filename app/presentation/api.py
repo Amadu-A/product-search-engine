@@ -27,6 +27,7 @@ from app.domain.catalog import (
     DependencyUnavailable,
     json_value,
 )
+from app.domain.product_identity import claim_value
 from app.infrastructure.catalog_formats import sample_catalog
 from app.presentation.dto import (
     ItemsPage,
@@ -157,10 +158,39 @@ def create_app(service=None) -> FastAPI:
 
     @app.exception_handler(SQLAlchemyError)
     async def database_error(request: Request, error: SQLAlchemyError):
-        """Скрывает параметры и credentials драйвера."""
-        return JSONResponse(
-            {"detail": "Операция БД откатилась; обновите данные и повторите"}, status_code=503
-        )
+        """Указывает неудавшуюся операцию и состояние задания без текста драйвера."""
+        endpoint = request.scope.get("endpoint")
+        operation = {
+            "upload": "загрузить файлы",
+            "start": "подготовить строки и поставить импорт в очередь",
+            "mapping": "сохранить сопоставление полей",
+            "reclassify": "поставить оставшиеся позиции на классификацию",
+            "control": "продолжить импорт"
+            if request.path_params.get("action") == "resume"
+            else "остановить импорт",
+            "job": "прочитать прогресс импорта",
+        }.get(getattr(endpoint, "__name__", ""), "выполнить операцию")
+        detail = f"Не удалось {operation}."
+        status = None
+        if job_id := request.path_params.get("job_id"):
+            try:
+                with service.store.transaction() as unit:
+                    status = unit.get("ingest_jobs", job_id)["status"]
+            except (CatalogError, SQLAlchemyError, ValueError):
+                detail += " Статус задания пока недоступен."
+            if status:
+                labels = {
+                    "preview_ready": "готово к запуску",
+                    "queued": "в очереди",
+                    "running": "обрабатывается",
+                    "canceled": "остановлено",
+                    "cancel_requested": "останавливается",
+                    "completed": "завершено",
+                    "completed_with_issues": "завершено с замечаниями",
+                    "failed": "ошибка",
+                }
+                detail += f" Задание {labels.get(status, status)}."
+        return JSONResponse({"detail": detail, "job_status": status}, status_code=503)
 
     @app.get("/", response_class=HTMLResponse, include_in_schema=False)
     def catalog(request: Request):
@@ -404,6 +434,9 @@ def create_app(service=None) -> FastAPI:
             raise HTTPException(404, "Товар не найден")
         understanding = row["attributes"].get("understanding") or {}
         row["features"] = understanding.get("attributes", [])
+        profile = row["attributes"].get("identity_profile")
+        if profile:
+            row.update(mark=claim_value(profile, "mark"), series=claim_value(profile, "series"))
         row["source_links"] = [link for link in row["source_links"] if source_url(link["url"])]
         return row
 

@@ -87,8 +87,10 @@ function listRow(product) {
   row.setAttribute('aria-selected', String(state.productId === product.id));
   open.addEventListener('click', () => openProduct(product.id, open));
   title.append(open);
+  const price = element('td', product.historical_price ? formatPrice(product.historical_price.amount, product.historical_price.currency) : '—');
+  if (product.historical_price) price.append(element('small', priceDate(product.historical_price), 'catalog-card__date'));
   row.append(title, element('td', product.mpn || '—'), element('td', product.manufacturer_name || '—'),
-    element('td', product.category_name || 'Без категории'));
+    element('td', product.category_name || 'Без категории'), element('td', number.format(product.seller_count)), price);
   return row;
 }
 
@@ -152,51 +154,89 @@ function candidateName(name, status) {
 
 function showProduct(product) {
   $('#catalog-card-title').textContent = product.canonical_name;
-  showFacts($('#catalog-identity'), [
-    ['Категория', product.category_path.join(' → ') || 'Без категории'],
-    ['Производитель', candidateName(product.manufacturer_name, product.manufacturer_status)],
-    ['Бренд', candidateName(product.brand_name, product.brand_status)],
-    ['Артикул', product.mpn || 'Не указан'],
-    ['Модель', product.model || 'Не указана'],
-    ['Тип изделия', product.product_type || 'Не указан'],
-    ['Единица', product.unit_code || 'Не указана'],
+  $('#catalog-category-path').textContent = product.category_path.join(' → ') || 'Без категории';
+  const identity = $('#catalog-identity');
+  identity.replaceChildren();
+  for (const [label, value] of [
+    ['Бренд', product.brand_name], ['Артикул', product.mpn],
+    ['Серия', product.series], ['Марка', product.mark],
+  ]) {
+    if (!value) continue;
+    const field = element('div');
+    field.append(element('dt', label), element('dd', value));
+    identity.append(field);
+  }
+  identity.hidden = !identity.children.length;
+  const rows = product.features.filter(item => item.value).map(item => [
+    item.name, [item.value, item.unit && !item.value.endsWith(item.unit) ? item.unit : null].filter(Boolean).join(' '),
   ]);
+  const main = rows.filter(([name]) => /размер|напряж|мощност|сечен|диаметр|креплен|жил|ток/i.test(name));
+  const primary = (main.length ? main : rows).slice(0, 5);
   const features = element('dl', undefined, 'catalog-card__facts');
-  showFacts(features, product.features.map(item => [item.name, [item.value, item.unit].filter(Boolean).join(' ')]));
-  $('#catalog-features').replaceChildren(product.features.length ? features : element('p', 'Характеристики отсутствуют', 'muted'));
+  showFacts(features, primary);
+  $('#catalog-features').replaceChildren(...(primary.length ? [features] : []));
+  const extra = [
+    ['Производитель', candidateName(product.manufacturer_name, product.manufacturer_status)],
+    ['Модель', product.model], ['Тип изделия', product.product_type], ['Единица', product.unit_code],
+    ...rows.filter(row => !primary.includes(row)),
+  ].filter((entry, index) => entry[1] && (index !== 0 || product.manufacturer_name));
+  showFacts($('#catalog-extra-facts'), extra);
+  $('#catalog-extra').hidden = !extra.length;
+  $('#catalog-extra').open = false;
   const links = element('ul', undefined, 'catalog-card__links');
   for (const source of product.source_links) {
     const row = element('li');
     row.append(sourceLink(source.url, source.source_name));
     links.append(row);
   }
-  $('#catalog-links').replaceChildren(product.source_links.length ? links : element('p', 'Исходные ссылки отсутствуют', 'muted'));
+  $('#catalog-links').replaceChildren(links);
+  $('#catalog-source-records').hidden = !product.source_links.length;
+  $('#catalog-source-records').open = false;
+}
+
+function priceDate(point) {
+  const value = point.source_reported_date || point.observed_at.slice(0, 10);
+  const [year, month, day] = value.split('-');
+  return `${point.source_reported_date ? 'Цена от' : 'Наблюдение от'} ${day}.${month}.${year}`;
+}
+
+function formatPrice(amount, currency) {
+  const price = amount.replace(/(\.\d*?[1-9])0+$|\.0+$/, '$1').replace('.', ',');
+  return [price, currency].filter(Boolean).join(' ');
 }
 
 function historicalPrice(point) {
   const amount = point.verified_amount ?? point.amount;
   const currency = point.verified_currency ?? point.currency;
   const unit = point.verified_unit ?? point.sale_unit;
-  const date = point.source_reported_date
-    ? `Дата источника ${point.source_reported_date}`
-    : `Наблюдение сохранено ${point.observed_at.slice(0, 10)}`;
+  const date = priceDate(point);
   if (amount === null) return `${date} · Некорректная цена: ${point.raw_price || 'значение отсутствует'}`;
-  const price = amount.replace(/(\.\d*?[1-9])0+$|\.0+$/, '$1').replace('.', ',');
   const verification = point.valid_from ? 'подтверждённое наблюдение' : 'наблюдение из источника';
-  return `${date} · ${price} ${currency || '(валюта не указана)'}${unit ? ` / ${unit}` : ''} · ${verification}`;
+  return `${date} · ${formatPrice(amount, currency)}${unit ? ` / ${unit}` : ''} · ${verification}`;
 }
 
 function showOffer(offer, offerOffset) {
   const card = element('article', undefined, 'catalog-card__offer');
-  card.append(element('h4', offer.seller_name || 'Продавец не указан'), element('p', offer.source_name, 'muted'));
-  if (offer.origin_url) card.append(sourceLink(offer.origin_url, 'Исходная страница предложения'));
+  const point = offer.price_history[0];
+  const head = element('div', undefined, 'catalog-card__offer-heading');
+  head.append(element('h4', offer.seller_name || 'Продавец не указан'));
+  const amount = point?.verified_amount ?? point?.amount;
+  const currency = point?.verified_currency ?? point?.currency;
+  if (amount != null) head.append(element('strong', formatPrice(amount, currency)));
+  card.append(head, element('p', offer.source_name, 'muted'));
+  if (amount != null && !currency) card.append(element('small', 'Валюта не указана', 'catalog-card__date'));
+  if (offer.origin_url) card.append(sourceLink(offer.origin_url, offer.original_name || 'Страница предложения'));
+  else if (offer.original_name) card.append(element('p', offer.original_name));
+  if (point) card.append(element('small', priceDate(point), 'catalog-card__date'));
   if (!offer.price_history.length) {
     card.append(element('p', 'История цен отсутствует', 'muted'));
     return card;
   }
   const list = element('ul', undefined, 'catalog-card__history');
   list.append(...offer.price_history.map(point => element('li', historicalPrice(point))));
-  card.append(list);
+  const details = element('details');
+  details.append(element('summary', 'История цен'), list);
+  card.append(details);
   if (offer.history_total > offer.price_history.length) {
     const more = element('button', 'Ещё наблюдения');
     more.type = 'button';
@@ -217,7 +257,7 @@ function showOffer(offer, offerOffset) {
         more.disabled = false;
       }
     });
-    card.append(more);
+    details.append(more);
   }
   return card;
 }
@@ -231,6 +271,7 @@ async function loadOffers() {
     if (token !== state.cardToken) return;
     $('#catalog-offers').append(...page.items.map((offer, index) => showOffer(offer, state.offerOffset + index)));
     if (page.total === 0) $('#catalog-offers').append(element('p', 'Сохранённых предложений нет', 'muted'));
+    $('#catalog-offers-count').textContent = page.total ? number.format(page.total) : '';
     state.offerOffset += page.items.length;
     button.hidden = state.offerOffset >= page.total;
   } catch (error) {
@@ -254,6 +295,7 @@ async function openProduct(id, trigger) {
   $('#catalog-card-title').textContent = 'Товар';
   $('#catalog-card-status').textContent = 'Загрузка…';
   $('#catalog-offers').replaceChildren();
+  $('#catalog-offers-count').textContent = '';
   $('#catalog-more-offers').hidden = true;
   $('#catalog-card-title').focus();
   try {

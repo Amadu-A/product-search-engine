@@ -40,8 +40,8 @@ from app.domain.catalog import (
     normalize_text,
     normalized_key,
     raw_type_understanding,
-    supported_candidate,
 )
+from app.domain.product_identity import claim_value, identity_profile
 
 
 class CatalogImport:
@@ -306,6 +306,11 @@ class CatalogImport:
             )
             response = {"id": str(job["id"]), "status": "queued", "total_count": total}
             unit.save_command(actor, key, request, response)
+        self.notify_worker(job_id)
+        return response
+
+    def notify_worker(self, job_id) -> None:
+        """Задание уже сохранено. При сбое доставки worker повторит публикацию."""
         try:
             self.queue.publish(str(job_id))
         except DependencyUnavailable:
@@ -313,15 +318,16 @@ class CatalogImport:
                 unit.event(
                     UUID(str(job_id)),
                     "queue.unavailable",
-                    "Брокер недоступен; durable job сохранён и будет доставлен повторно",
+                    "Задание в очереди PostgreSQL. Доставить уведомление сейчас не удалось.",
                     level="warning",
                 )
-        return response
 
     def observation(self, unit, source: dict, raw: dict, norm: dict, row: InputRow) -> None:
         """Сохраняет историческое наблюдение без проверки магазина/валюты/актуальности."""
         fields = norm["attributes"]["fields"]
-        if row.fields.get("price") is None and not fields.get("product_url"):
+        if row.fields.get("price") is None and not (
+            fields.get("product_url") or fields.get("seller")
+        ):
             return
         seller = None
         if fields.get("seller"):
@@ -587,7 +593,9 @@ class CatalogImport:
                     evidence={"issuer": fields.get("manufacturer") or fields.get("brand")},
                 )
         product_id = product["id"] if product else None
-        if self.assign_existing(item, norm, product_id, fields, {"product_type": fields["name"]}):
+        if self.assign_existing(
+            item, norm, product_id, fields, {"product_type": fields["name"]}, allow_hint=False
+        ):
             return
         self.stage(item, "understanding")
         try:
@@ -597,7 +605,7 @@ class CatalogImport:
             if answer is None:
                 raise
             usage["understanding_origin"] = "raw_name"
-        if reclassify or usage.get("understanding_origin") == "raw_name":
+        if reclassify:
             self.classify_saved(item, norm, product, answer, usage)
             return
         if (
@@ -623,47 +631,43 @@ class CatalogImport:
                 self.finish_item(unit, item, status)
             return
         self.stage(item, "matching")
+        profile = identity_profile(fields, answer)
         with self.store.transaction() as unit:
-            product = unit.confirmed_product(
-                {
-                    **fields,
-                    "brand": fields["brand"]
-                    or supported_candidate(answer["brand_candidate"], fields),
-                    "manufacturer": fields["manufacturer"]
-                    or supported_candidate(answer["manufacturer_candidate"], fields),
-                    "mpn": fields["mpn"] or supported_candidate(answer["mpn_candidate"], fields),
-                }
-            )
+            unit.freeze_taxonomy()
             previous = [
                 d
-                for d in unit.all("product_match_decisions", normalized_record_id=norm["id"])
-                if d["product_id"] and d["status"] in {"candidate", "confirmed"}
+                for d in matches
+                if d["product_id"]
+                and d["status"] in {"candidate", "confirmed"}
+                and d["product_id"] not in rejected_ids
             ]
-            candidates_products = unit.product_candidates(fields)
-            rejected = {
-                d["product_id"]
-                for d in unit.all("product_match_decisions", normalized_record_id=norm["id"])
-                if d["stage"] == "manual" and d["status"] == "rejected"
-            }
-            previous = [d for d in previous if d["product_id"] not in rejected]
-            if product and product["id"] in rejected:
-                product = None
-            if product is None and previous:
-                product = unit.get("products", previous[-1]["product_id"])
+            method = "existing_record"
+            if not product and previous:
+                saved = max(previous, key=lambda d: d["created_at"])
+                product = unit.get("products", saved["product_id"])
+            if not product:
+                lookup = {
+                    **fields,
+                    **{key: claim_value(profile, key) for key in ("brand", "manufacturer", "mpn")},
+                }
+                product = unit.confirmed_product(lookup) or unit.find_identity_product(profile)
+                if product and product["id"] in rejected_ids:
+                    product = None
+                method = "source_identity"
             if product and self.keep_archived_product(unit, item, product["id"]):
                 return
+            reused = product is not None
             if product is None:
-                product = self.create_provisional(unit, item, fields, answer)
+                product = self.create_provisional(unit, item, fields, answer, profile)
+            else:
+                unit.remember_identity(product["id"], profile)
             unit.add(
                 "product_match_decisions",
                 normalized_record_id=norm["id"],
                 product_id=product["id"],
                 stage="after_understanding",
-                method="confirmed_identifiers"
-                if product["status"] == "identified"
-                else "new_provisional_no_identity_merge",
-                status="confirmed" if product["status"] == "identified" else "candidate",
-                candidate_product_ids=[str(p["id"]) for p in candidates_products],
+                method=method if reused else "new_provisional_no_identity_merge",
+                status="confirmed" if reused else "candidate",
                 evidence={"answer_1": answer},
             )
             unit.update("ingest_job_items", item["id"], product_id=product["id"])
@@ -788,7 +792,9 @@ class CatalogImport:
             with self.store.transaction() as unit:
                 unit.event(item["job_id"], kind, message, item_id=item["id"], data=data)
 
-        result = self.classifier.select(fields, answer, emit)
+        result = self.classifier.select(
+            fields, {key: value for key, value in answer.items() if key != "identifiers"}, emit
+        )
         with self.store.transaction() as unit:
             unit.freeze_taxonomy()
             fresh = unit.get("ingest_job_items", item["id"], lock=True)
@@ -861,7 +867,7 @@ class CatalogImport:
             else:
                 self.save_unresolved(unit, item, product_id, answer, result, evidence, provenance)
 
-    def assign_existing(self, item, norm, product_id, fields, answer) -> bool:
+    def assign_existing(self, item, norm, product_id, fields, answer, *, allow_hint=True) -> bool:
         """Принимает действующую связь товара или утверждённое соответствие из SQL."""
         with self.store.transaction() as unit:
             unit.freeze_taxonomy()
@@ -918,6 +924,8 @@ class CatalogImport:
                     unit, item, item["category_id"], product_id, "existing_product"
                 )
                 return True
+            if not allow_hint:
+                return False
             hint = unit.approved_category_hint(item["raw_record_id"], fields, answer)
             explicit_type = (
                 answer
@@ -944,19 +952,20 @@ class CatalogImport:
         return False
 
     def create_provisional(
-        self, unit, item: dict, fields: dict, answer: dict | None = None
+        self,
+        unit,
+        item: dict,
+        fields: dict,
+        answer: dict | None = None,
+        profile: dict | None = None,
     ) -> dict:
         """Создаёт самостоятельный Product и сохраняет задание создания для отчёта."""
         if not fields.get("name"):
             raise CatalogError("Для создания Product нужно исходное наименование изделия")
-        return unit.add(
+        product = unit.add(
             "products",
             canonical_name=fields["name"],
-            brand_id=unit.directory_candidate("brands", fields.get("brand")),
-            manufacturer_id=unit.directory_candidate("manufacturers", fields.get("manufacturer")),
             product_type=answer.get("product_type") if answer else None,
-            mpn=fields.get("mpn"),
-            normalized_mpn=normalized_key(fields.get("mpn")) or None,
             unit_code=fields.get("unit"),
             attributes={
                 "identity_fields": {k: fields.get(k) for k in ("unit", "quantity")},
@@ -964,6 +973,8 @@ class CatalogImport:
                 "created_in_job_id": str(item["job_id"]),
             },
         )
+        unit.remember_identity(product["id"], profile or identity_profile(fields, answer))
+        return product
 
     def ensure_assignment_product(self, unit, item, product_id, answer=None):
         """Переиспользует связь той же нормализованной записи или создаёт свой Product."""
@@ -1213,11 +1224,7 @@ class CatalogImport:
                     data={"count": len(items)},
                 )
         if apply and items:
-            try:
-                self.queue.publish(str(job_id))
-            except DependencyUnavailable:
-                # Worker публикует оставшиеся queued задания из PostgreSQL.
-                pass
+            self.notify_worker(job_id)
         return {"id": str(job_id), "eligible": len(items), "queued": bool(apply and items)}
 
     def archive_product(self, product_id, actor: str, key: str) -> dict:
@@ -1318,7 +1325,7 @@ class CatalogImport:
                 raise CatalogError("Неизвестная команда задания")
             unit.event(job["id"], "job." + action, "Запрошено: " + action)
         if action == "resume":
-            self.queue.publish(str(job_id))
+            self.notify_worker(job_id)
         return self.job(job_id)
 
     def job(self, job_id) -> dict:

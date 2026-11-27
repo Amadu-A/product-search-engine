@@ -50,7 +50,7 @@
         <div class="catalog-results__scroll">
           <table class="catalog-results__table">
             <caption class="catalog__sr-only">Товары по выбранным фильтрам</caption>
-            <thead><tr><th scope="col">Наименование</th><th scope="col">Артикул</th><th scope="col">Производитель</th><th scope="col">Категория</th></tr></thead>
+            <thead><tr><th scope="col">Наименование</th><th scope="col">Артикул</th><th scope="col">Производитель</th><th scope="col">Категория</th><th scope="col">Продавцы</th><th scope="col">Историческая цена</th></tr></thead>
             <tbody id="catalog-products"></tbody>
           </table>
         </div>
@@ -68,15 +68,17 @@
         </div>
         <p id="catalog-card-status" role="status"></p>
         <div id="catalog-card-body" hidden>
-          <dl id="catalog-identity" class="catalog-card__facts"></dl>
-          <section><h3>Характеристики</h3><div id="catalog-features"></div></section>
-          <section><h3>Исходные ссылки</h3><div id="catalog-links"></div></section>
+          <p id="catalog-category-path" class="catalog-card__category"></p>
+          <dl id="catalog-identity" class="catalog-card__badges"></dl>
+          <div id="catalog-features"></div>
           <section>
-            <h3>Продавцы и история цен</h3>
-            <p class="muted">Цены сохранены из источников. Актуальная цена неизвестна.</p>
+            <div class="catalog-card__section-heading"><h3>Предложения продавцов</h3><span id="catalog-offers-count" class="muted"></span></div>
+            <p class="muted">Исторические цены. Актуальная цена неизвестна.</p>
             <div id="catalog-offers"></div>
             <button id="catalog-more-offers" type="button" hidden>Ещё продавцы</button>
           </section>
+          <details id="catalog-extra" hidden><summary>Дополнительные характеристики</summary><dl id="catalog-extra-facts" class="catalog-card__facts"></dl></details>
+          <details id="catalog-source-records" hidden><summary>Исходные записи</summary><div id="catalog-links"></div></details>
         </div>
       </aside>
     </div>

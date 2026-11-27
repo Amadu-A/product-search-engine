@@ -38,7 +38,7 @@ def test_migration_matches_models(db_engine):
     """Живая Alembic schema точно соответствует ORM metadata и readiness-контракту."""
     assert check_database(db_engine) == {
         "status": "ready",
-        "revision": "0004_catalog_read_model",
+        "revision": "0005_product_identity",
         "categories": 0,
     }
     with db_engine.connect() as conn:

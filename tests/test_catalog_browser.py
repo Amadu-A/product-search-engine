@@ -115,13 +115,15 @@ def test_public_catalog_filters_pagination_and_price_card(browser_workspace, tmp
         expect(page.locator("#catalog-total")).to_have_text("Товаров: 1")
         page.get_by_role("button", name="Кабель стендовый").click()
         expect(page.locator("#catalog-card-title")).to_have_text("Кабель стендовый")
-        expect(page.locator("#catalog-identity")).to_contain_text("Пробный завод")
+        page.locator("#catalog-extra summary").click()
+        expect(page.locator("#catalog-extra-facts")).to_contain_text("Пробный завод")
         expect(page.locator("#catalog-features")).to_contain_text("Сечение")
         expect(page.locator("#catalog-links a").first).to_have_attribute(
             "href", "https://example.org/catalog-example"
         )
         expect(page.locator("#catalog-offers")).to_contain_text("Пробный магазин")
-        expect(page.locator("#catalog-offers")).to_contain_text("2024-11-15")
+        expect(page.locator("#catalog-offers")).to_contain_text("15.11.2024")
+        expect(page.locator("#catalog-offers a")).to_have_text("Кабель стендовый")
         expect(page.locator("#catalog-offers")).to_contain_text("49,5 RUB")
         expect(page.locator("#catalog-card")).to_contain_text("Актуальная цена неизвестна")
         Path(".tmp/browser/catalog").mkdir(parents=True, exist_ok=True)

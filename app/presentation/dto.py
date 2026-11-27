@@ -131,6 +131,15 @@ class TreeNodeView(BaseModel):
     ancestors_active: bool
 
 
+class HistoricalPriceView(BaseModel):
+    """Цена с датой источника или временем записи наблюдения."""
+
+    amount: Decimal
+    currency: str | None
+    source_reported_date: date | None
+    observed_at: datetime
+
+
 class ProductView(BaseModel):
     """Поля строки каталога из Product и его справочников."""
 
@@ -149,6 +158,8 @@ class ProductView(BaseModel):
     model: str | None
     product_type: str | None
     unit_code: str | None
+    seller_count: int = 0
+    historical_price: HistoricalPriceView | None = None
     status: str
     attributes: dict
     created_at: datetime
@@ -185,6 +196,8 @@ class ProductDetailView(ProductView):
     category_path: list[str]
     features: list[ProductFeature]
     source_links: list[SourceLink]
+    mark: str | None = None
+    series: str | None = None
 
 
 class ManufacturerView(BaseModel):
@@ -220,6 +233,7 @@ class OfferView(BaseModel):
     seller_name: str | None
     source_name: str
     origin_url: str | None
+    original_name: str | None = None
     sale_unit: str | None
     pack_quantity: Decimal | None
     price_history: list[PriceObservationView]

@@ -2,7 +2,9 @@
 """CLI этапа 02 обращается к тем же use-case, что Swagger и браузер."""
 
 import json
+import re
 
+from app.application.product_merge import ProductMerge
 from app.catalog_bootstrap import build_catalog
 from app.domain.catalog import CatalogError
 
@@ -40,6 +42,18 @@ def dispatch_catalog(args, settings) -> dict:
             "warnings": parsed.warnings,
         }
     service = build_catalog(settings)
+    if args.command == "merge-products":
+        merge = ProductMerge(service.store)
+        if not args.apply:
+            return merge.preview()
+        if (
+            not re.fullmatch(r"[a-f0-9]{64}", args.expected_sha256 or "")
+            or not args.idempotency_key
+        ):
+            raise CatalogError(
+                "Применение требует SHA-256 проверенного preview и ключ идемпотентности"
+            )
+        return merge.apply(args.expected_sha256, args.idempotency_key)
     if args.command in {"taxonomy-change", "taxonomy-change-apply", "taxonomy-singletons"}:
         from app.application.taxonomy_review import TaxonomyReview
 

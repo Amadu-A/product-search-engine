@@ -16,6 +16,7 @@ import httpx
 from jsonschema import Draft202012Validator
 
 from app.domain.catalog import DependencyUnavailable, InvalidModelOutput, fingerprint
+from app.domain.product_identity import IDENTIFIERS, literal
 from app.settings import Settings
 
 
@@ -269,12 +270,46 @@ class SharedInference:
                 raise invalid("uuid", "UUID не разрешён для действия на этом уровне")
             return answer
         if step == 1:
-            allowed = {e["evidence_id"] for e in values["evidence_bundle_json"]["evidence"]}
+            sources = {
+                e["evidence_id"]: e["text"] for e in values["evidence_bundle_json"]["evidence"]
+            }
+            allowed = set(sources)
             used = set(answer["evidence_ids"])
+            for kind, claim in answer["identifiers"].items():
+                if claim is None:
+                    continue
+                refs = set(claim["evidence_ids"])
+                used.update(refs)
+                if claim["origin"] == "inferred" and refs:
+                    raise invalid("evidence", "Предположение не должно ссылаться на исходный факт")
+                if claim["origin"] == "source" and not any(
+                    ref in {"raw_name", f"raw_{kind}"}
+                    and literal(claim["value"], sources.get(ref, ""))
+                    for ref in refs
+                ):
+                    raise invalid("evidence", "Идентификатор отсутствует в указанном исходном поле")
             for attribute in answer["attributes"]:
                 used.update(attribute["evidence_ids"])
             if answer["status"] == "recognized" and not used:
                 raise invalid("evidence", "recognized без evidence")
+            answer["attributes"] = [
+                entry
+                for entry in answer["attributes"]
+                if "raw_name" in entry["evidence_ids"]
+                and any(
+                    literal(value, sources.get("raw_name", ""))
+                    for value in (
+                        entry["value"],
+                        entry["value"] + (entry["unit"] or ""),
+                        entry["value"] + " " + (entry["unit"] or ""),
+                    )
+                )
+            ]
+            for kind in ("brand", "manufacturer", "mpn"):
+                identity = answer["identifiers"][kind]
+                answer[f"{kind}_candidate"] = (
+                    identity["value"] if identity and identity["origin"] == "source" else None
+                )
         else:
             allowed = set(values["answer_1_json"]["evidence_ids"])
             for attribute in values["answer_1_json"]["attributes"]:
@@ -339,6 +374,12 @@ class SharedInference:
             "brand_candidate": fields.get("brand"),
             "manufacturer_candidate": fields.get("manufacturer"),
             "mpn_candidate": fields.get("mpn"),
+            "identifiers": {
+                key: {"value": fields[key], "origin": "source", "evidence_ids": [f"raw_{key}"]}
+                if fields.get(key)
+                else None
+                for key in (*IDENTIFIERS, "seller_code")
+            },
             "attributes": [],
             "evidence_ids": [e["evidence_id"] for e in bundle["evidence"]],
             "reason": "MOCK: только тестовый ответ, не проверка модели",

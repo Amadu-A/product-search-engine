@@ -84,6 +84,10 @@ def parser() -> argparse.ArgumentParser:
         "--only-remaining", action="store_true", help="Только позиции на автоматической проверке"
     )
     reclassify.add_argument("--apply", action="store_true")
+    merge = commands.add_parser("merge-products", help="Объединение доказанных дублей")
+    merge.add_argument("--apply", action="store_true")
+    merge.add_argument("--expected-sha256")
+    merge.add_argument("--idempotency-key")
     decision = commands.add_parser("review-item")
     decision.add_argument("--item-id", required=True)
     decision.add_argument("--decision-file", type=Path, required=True)
@@ -143,6 +147,7 @@ def dispatch(args: argparse.Namespace, settings: Settings) -> dict:
         "import-file",
         "import-report",
         "reclassify",
+        "merge-products",
         "review-item",
         "create-category",
         "taxonomy-index-status",
