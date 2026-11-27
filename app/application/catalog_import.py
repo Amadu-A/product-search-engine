@@ -4,7 +4,7 @@
 import hashlib
 import shutil
 import threading
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import UTC, date, datetime
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -232,15 +232,18 @@ class CatalogImport:
                     status="pending",
                 )
                 unit.connection_insert_run(job["id"], file["id"], run["id"])
+                items = []
+                version = NORMALIZER_VERSION + ":" + fingerprint(parsed.mapping)[:12]
                 for row in parsed.rows:
                     normalized = normalize_row(row)
                     fields = normalized["fields"]
+                    payload_hash = fingerprint(row.raw)
                     raw = unit.unique(
                         "raw_records",
                         {
                             "source_id": source["id"],
-                            "source_key": str(fields["source_key"] or fingerprint(row.raw)),
-                            "payload_sha256": fingerprint(row.raw),
+                            "source_key": str(fields["source_key"] or payload_hash),
+                            "payload_sha256": payload_hash,
                         },
                         first_run_id=run["id"],
                         payload=row.raw,
@@ -250,7 +253,6 @@ class CatalogImport:
                         if fields["price_date"]
                         else None,
                     )
-                    version = NORMALIZER_VERSION + ":" + fingerprint(parsed.mapping)[:12]
                     norm = unit.unique(
                         "normalized_records",
                         {"raw_record_id": raw["id"], "normalizer_version": version},
@@ -271,8 +273,8 @@ class CatalogImport:
                         issues=normalized["issues"],
                         status=normalized["status"],
                     )
-                    item = unit.add(
-                        "ingest_job_items",
+                    item = dict(
+                        id=uuid4(),
                         job_id=job["id"],
                         file_id=file["id"],
                         item_position=row.position,
@@ -284,6 +286,10 @@ class CatalogImport:
                         issue_codes=[i["code"] for i in norm["issues"]],
                     )
                     self.observation(unit, source, raw, norm, row)
+                    items.append(item)
+                    if len(items) == 250 or item["status"] == "invalid_record":
+                        unit.add_items(items)
+                        items.clear()
                     if item["status"] == "invalid_record":
                         unit.event(
                             job["id"],
@@ -292,9 +298,9 @@ class CatalogImport:
                             item_id=item["id"],
                             level="warning",
                         )
+                unit.add_items(items)
                 total += len(parsed.rows)
-            unit.update("ingest_jobs", job["id"], status="queued", total_count=total)
-            unit.refresh_counts(job["id"])
+            unit.update("ingest_jobs", job["id"], status="queued")
             unit.event(
                 job["id"], "job.queued", "Импорт поставлен в очередь", data={"total_count": total}
             )
@@ -449,7 +455,6 @@ class CatalogImport:
                         item_id=item["id"],
                         level="warning",
                     )
-                    unit.refresh_counts(UUID(job_id))
             except Exception as error:
                 with self.store.transaction() as unit:
                     fresh = unit.get("ingest_job_items", item["id"], lock=True)
@@ -471,7 +476,6 @@ class CatalogImport:
                         item_id=item["id"],
                         level="error",
                     )
-                    unit.refresh_counts(UUID(job_id))
         with self.store.transaction() as unit:
             counts = unit.refresh_counts(UUID(job_id))
             job = unit.get("ingest_jobs", job_id)
@@ -948,6 +952,8 @@ class CatalogImport:
         return unit.add(
             "products",
             canonical_name=fields["name"],
+            brand_id=unit.directory_candidate("brands", fields.get("brand")),
+            manufacturer_id=unit.directory_candidate("manufacturers", fields.get("manufacturer")),
             product_type=answer.get("product_type") if answer else None,
             mpn=fields.get("mpn"),
             normalized_mpn=normalized_key(fields.get("mpn")) or None,
@@ -1153,7 +1159,6 @@ class CatalogImport:
         )
         if product_id:
             unit.attach_offer(item["raw_record_id"], product_id)
-        unit.refresh_counts(item["job_id"])
         unit.event(
             item["job_id"],
             "item." + status,
@@ -1201,7 +1206,6 @@ class CatalogImport:
                     cancel_requested=False,
                     finished_at=None,
                 )
-                unit.refresh_counts(job["id"])
                 unit.event(
                     job["id"],
                     "job.reclassify",
@@ -1377,18 +1381,34 @@ class CatalogImport:
             files = unit.all("ingest_job_files", job_id=job["id"])
             norm_ids = list({r["normalized_record_id"] for r in rows if r["normalized_record_id"]})
             normalized = {n["id"]: n for n in unit.related("normalized_records", "id", norm_ids)}
-            decisions = unit.related("classification_decisions", "normalized_record_id", norm_ids)
-            tasks = unit.related("review_tasks", "normalized_record_id", norm_ids)
+            decisions = unit.related(
+                "classification_decisions",
+                "normalized_record_id",
+                norm_ids,
+                "normalized_record_id",
+                "created_at",
+                "method",
+                "status",
+            )
+            tasks = unit.related(
+                "review_tasks", "normalized_record_id", norm_ids, "normalized_record_id", "id"
+            )
             database_counts = unit.catalog_counts()
             duplicate_key_groups = unit.duplicate_key_groups()
         categories = {str(c["id"]): c for c in self.store.categories()}
         files_by_id = {f["id"]: f for f in files}
+        latest = {}
+        for decision in decisions:
+            key = decision["normalized_record_id"]
+            if key not in latest or latest[key]["created_at"] < decision["created_at"]:
+                latest[key] = decision
+        task_ids = defaultdict(list)
+        for task in tasks:
+            task_ids[task["normalized_record_id"]].append(task["id"])
         for row in rows:
-            norm = normalized.get(row["normalized_record_id"], {})
-            matching = [
-                d for d in decisions if d["normalized_record_id"] == row["normalized_record_id"]
-            ]
-            last = max(matching, key=lambda d: d["created_at"]) if matching else None
+            key = row["normalized_record_id"]
+            norm = normalized.get(key, {})
+            last = latest.get(key)
             row.update(
                 source_file=files_by_id[row["file_id"]]["original_filename"],
                 sheet=row["sheet_name"],
@@ -1397,11 +1417,7 @@ class CatalogImport:
                 category_path=categories.get(str(row["category_id"]), {}).get("path_names"),
                 decision_method=last["method"] if last else None,
                 decision_status=last["status"] if last else None,
-                review_task_ids=[
-                    t["id"]
-                    for t in tasks
-                    if t["normalized_record_id"] == row["normalized_record_id"]
-                ],
+                review_task_ids=task_ids[key],
             )
         return json_value(
             {
@@ -1560,11 +1576,7 @@ class CatalogImport:
                     evidence={"reason": reason},
                     decided_by=actor,
                 )
-                affected_jobs = unit.assign_record_items(
-                    item["normalized_record_id"], category_id, product_id
-                )
-                for affected_job in affected_jobs:
-                    unit.refresh_counts(affected_job)
+                unit.assign_record_items(item["normalized_record_id"], category_id, product_id)
                 unit.update("products", product_id, category_id=category_id)
                 unit.attach_offer(item["raw_record_id"], product_id)
                 for gap in unit.all(
@@ -1697,7 +1709,6 @@ class CatalogImport:
                         resolution=values,
                         resolved_at=datetime.now(UTC),
                     )
-            unit.refresh_counts(item["job_id"])
             unit.event(
                 item["job_id"],
                 "review.decided",

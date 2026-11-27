@@ -590,4 +590,5 @@ await indexStatus().catch(fail);
 setInterval(() => indexStatus().catch(fail), 5000);
 const jobId = new URL(location).searchParams.get('job') || localStorage.getItem('pse-import-job');
 if (jobId) await selectJob(jobId).catch(fail);
-if (location.pathname === '/admin/review') showView('review');
+const section = {'/admin/review':'review', '/admin/categories':'categories', '/admin/history':'history'}[location.pathname];
+if (section) showView(section);

@@ -7,9 +7,10 @@ import io
 import json
 from pathlib import Path
 from typing import Annotated, Literal
+from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
-from fastapi import FastAPI, File, Form, Header, Query, Request, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -27,7 +28,29 @@ from app.domain.catalog import (
     json_value,
 )
 from app.infrastructure.catalog_formats import sample_catalog
-from app.presentation.dto import ItemsPage, JobView, PreviewView, TreeNodeView
+from app.presentation.dto import (
+    ItemsPage,
+    JobView,
+    ManufacturerView,
+    OffersPage,
+    PreviewView,
+    ProductDetailView,
+    ProductsPage,
+    TreeNodeView,
+)
+
+
+def source_url(value: str | None) -> str | None:
+    """Разрешает показать сохранённую web-ссылку с хостом и без учётных данных."""
+    if not value or any(char.isspace() or ord(char) < 32 for char in value):
+        return None
+    try:
+        address = urlsplit(value)
+        if address.scheme in {"http", "https"} and address.hostname and address.username is None:
+            return value
+    except ValueError:
+        return None
+    return None
 
 
 class MappingInput(BaseModel):
@@ -139,9 +162,15 @@ def create_app(service=None) -> FastAPI:
             {"detail": "Операция БД откатилась; обновите данные и повторите"}, status_code=503
         )
 
-    @app.get("/", include_in_schema=False)
+    @app.get("/", response_class=HTMLResponse, include_in_schema=False)
+    def catalog(request: Request):
+        """Отдаёт главную страницу просмотра каталога."""
+        return templates.TemplateResponse(request=request, name="catalog.html")
+
     @app.get("/admin/import", response_class=HTMLResponse, include_in_schema=False)
     @app.get("/admin/review", response_class=HTMLResponse, include_in_schema=False)
+    @app.get("/admin/categories", response_class=HTMLResponse, include_in_schema=False)
+    @app.get("/admin/history", response_class=HTMLResponse, include_in_schema=False)
     def workspace(request: Request):
         """Отдаёт действующее рабочее место с явной маркировкой режима inference."""
         return templates.TemplateResponse(
@@ -340,15 +369,60 @@ def create_app(service=None) -> FastAPI:
         """Возвращает тот же trace, что карточка позиции import job."""
         return service.item_detail(item_id)
 
-    @app.get("/api/v1/products")
+    @app.get("/api/v1/products", response_model=ProductsPage)
     def products(
         q: str = Query("", max_length=200),
         offset: int = Query(0, ge=0),
         limit: int = Query(50, ge=1, le=200),
+        category_id: UUID | None = None,
+        uncategorized: bool = False,
+        manufacturer_id: UUID | None = None,
+        sort: Literal[
+            "created_asc", "created_desc", "name_asc", "name_desc", "mpn_asc"
+        ] = "created_asc",
     ):
         """Просмотр Product без поля current price и без сетевого обхода магазинов."""
+        if category_id and uncategorized:
+            raise HTTPException(422, "Выберите категорию либо товары без категории")
         with service.store.transaction() as unit:
-            return json_value(unit.products_page(q, offset, limit))
+            return unit.products_page(
+                q, offset, limit, category_id, uncategorized, manufacturer_id, sort
+            )
+
+    @app.get("/api/v1/manufacturers", response_model=list[ManufacturerView])
+    def manufacturers():
+        """Даёт варианты фильтра производителя по доступному каталогу."""
+        with service.store.transaction() as unit:
+            return unit.catalog_manufacturers()
+
+    @app.get("/api/v1/products/{product_id}", response_model=ProductDetailView)
+    def product(product_id: UUID):
+        """Возвращает карточку, полный путь категории и исходные ссылки."""
+        with service.store.transaction() as unit:
+            row = unit.product_detail(product_id)
+        if row is None:
+            raise HTTPException(404, "Товар не найден")
+        understanding = row["attributes"].get("understanding") or {}
+        row["features"] = understanding.get("attributes", [])
+        row["source_links"] = [link for link in row["source_links"] if source_url(link["url"])]
+        return row
+
+    @app.get("/api/v1/products/{product_id}/offers", response_model=OffersPage)
+    def product_offers(
+        product_id: UUID,
+        offset: int = Query(0, ge=0),
+        limit: int = Query(20, ge=1, le=100),
+        history_offset: int = Query(0, ge=0),
+        history_limit: int = Query(20, ge=1, le=200),
+    ):
+        """Отдаёт продавцов и историю наблюдений без проверки внешних ссылок."""
+        with service.store.transaction() as unit:
+            page = unit.product_offers(product_id, offset, limit, history_offset, history_limit)
+        if page is None:
+            raise HTTPException(404, "Товар не найден")
+        for row in page["items"]:
+            row["origin_url"] = source_url(row["origin_url"])
+        return page
 
     @app.post("/api/v1/products/{product_id}/archive")
     def archive_product(

@@ -10,8 +10,8 @@ if [[ "$mode" == '--live' || "$mode" == '--classification-live' ]]; then
     test -f examples/aitim_200_raw.json && test -f data/fixtures/categories_fixture.dump || { echo 'LIVE требует AITIM-200 и approved fixture dump'; exit 1; }
     docker network inspect ai-shared >/dev/null
     dc=(docker compose -p product-search-engine-live-tests -f compose.test.yaml -f compose.live-test.yaml)
-elif [[ $# -gt 0 ]]; then
-    echo 'Используйте bash scripts/test.sh [--live|--classification-live]' >&2; exit 1
+elif [[ $# -gt 0 && "$mode" != '--catalog-load' ]]; then
+    echo 'Используйте bash scripts/test.sh [--live|--classification-live|--catalog-load]' >&2; exit 1
 fi
 cleanup() {
     # Удаляются только временные контейнеры этого test project; volumes не используются.
@@ -27,6 +27,8 @@ if [[ "$mode" == '--classification-live' ]]; then
     "${dc[@]}" run --rm --no-deps tests -m pytest tests/test_classification_live.py -s -ra
 elif [[ "$mode" == '--live' ]]; then
     "${dc[@]}" run --rm --no-deps tests -m pytest tests/test_catalog_live.py tests/test_catalog_browser.py::test_aitim200_browser_sql_qdrant --junitxml=.tmp/reports/pytest-live-browser.xml -ra
+elif [[ "$mode" == '--catalog-load' ]]; then
+    "${dc[@]}" run --rm --no-deps -e CATALOG_LOAD_TEST=1 tests -m pytest tests/test_catalog_load.py -s -ra
 else
     "${dc[@]}" run --rm --no-deps tests
 fi

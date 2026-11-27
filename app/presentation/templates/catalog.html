@@ -1,0 +1,85 @@
+<!-- app/presentation/templates/catalog.html -->
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Каталог товаров · Product Search Engine</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+  <script type="module" src="/static/js/catalog.js"></script>
+</head>
+<body class="catalog">
+  <header class="catalog-header">
+    <a class="catalog-header__brand" href="/">Product Search Engine</a>
+    <nav class="catalog-header__nav" aria-label="Разделы сервиса">
+      <a href="/" aria-current="page">Каталог</a>
+      <a href="/admin/import">Импорт</a>
+      <a href="/admin/review">Проверка</a>
+      <a href="/admin/categories">Категории</a>
+      <a href="/admin/history">История</a>
+    </nav>
+  </header>
+  <main class="catalog__main">
+    <h1>Каталог товаров</h1>
+    <div class="catalog__layout">
+      <aside class="catalog__sidebar" aria-labelledby="catalog-tree-title">
+        <h2 id="catalog-tree-title">Категории</h2>
+        <nav id="catalog-tree" aria-label="Дерево категорий">
+          <button id="catalog-all" class="catalog-tree__choice" type="button" aria-pressed="true">Все товары</button>
+          <button id="catalog-uncategorized" class="catalog-tree__choice" type="button" aria-pressed="false">Без категории</button>
+          <div id="catalog-branches"></div>
+        </nav>
+      </aside>
+      <section class="catalog-results" aria-labelledby="catalog-collection">
+        <div class="catalog-results__heading">
+          <h2 id="catalog-collection">Все товары</h2>
+          <p id="catalog-total" role="status"></p>
+        </div>
+        <form id="catalog-filters" class="catalog-results__filters">
+          <label>Поиск<input id="catalog-search" name="q" type="search" maxlength="200" placeholder="Наименование или артикул"></label>
+          <button type="submit" class="button--primary">Найти</button>
+          <label>Производитель<select id="catalog-manufacturer" name="manufacturer_id"><option value="">Все производители</option></select></label>
+          <label>Сортировка<select id="catalog-sort" name="sort">
+            <option value="name_asc">По названию А–Я</option>
+            <option value="name_desc">По названию Я–А</option>
+            <option value="mpn_asc">По артикулу</option>
+            <option value="created_desc">Сначала новые</option>
+          </select></label>
+        </form>
+        <p id="catalog-error" class="catalog__error" role="alert" hidden></p>
+        <div class="catalog-results__scroll">
+          <table class="catalog-results__table">
+            <caption class="catalog__sr-only">Товары по выбранным фильтрам</caption>
+            <thead><tr><th scope="col">Наименование</th><th scope="col">Артикул</th><th scope="col">Производитель</th><th scope="col">Категория</th></tr></thead>
+            <tbody id="catalog-products"></tbody>
+          </table>
+        </div>
+        <p class="catalog-results__empty" id="catalog-empty" hidden>Товары не найдены</p>
+        <div class="catalog-results__pagination">
+          <button type="button" id="catalog-prev" disabled>Назад</button>
+          <span id="catalog-page" aria-live="polite"></span>
+          <button type="button" id="catalog-next" disabled>Далее</button>
+        </div>
+      </section>
+      <aside id="catalog-card" class="catalog-card" aria-labelledby="catalog-card-title" hidden>
+        <div class="catalog-card__heading">
+          <h2 id="catalog-card-title" tabindex="-1">Товар</h2>
+          <button id="catalog-close" type="button">Закрыть</button>
+        </div>
+        <p id="catalog-card-status" role="status"></p>
+        <div id="catalog-card-body" hidden>
+          <dl id="catalog-identity" class="catalog-card__facts"></dl>
+          <section><h3>Характеристики</h3><div id="catalog-features"></div></section>
+          <section><h3>Исходные ссылки</h3><div id="catalog-links"></div></section>
+          <section>
+            <h3>Продавцы и история цен</h3>
+            <p class="muted">Цены сохранены из источников. Актуальная цена неизвестна.</p>
+            <div id="catalog-offers"></div>
+            <button id="catalog-more-offers" type="button" hidden>Ещё продавцы</button>
+          </section>
+        </div>
+      </aside>
+    </div>
+  </main>
+</body>
+</html>

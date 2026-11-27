@@ -1,6 +1,10 @@
 <!-- README.md -->
 # Product Search Engine
 
+Главная страница `/` — каталог товаров с деревом категорий, поиском, фильтром
+производителя, страницами результатов и карточкой с историей цен.
+[Возможности каталога и API](docs/catalog.md).
+
 Импорт каталогов товаров в PostgreSQL с нормализацией, распознаванием через shared
 VLM, поиском категорий в проектном Qdrant и ручной проверкой. Рабочее место:
 `/admin/import`, проверка: `/admin/review`, Swagger: `/docs`.
@@ -40,10 +44,14 @@ bash scripts/up.sh
 deploy повторно сверить `ss -lnt`. По умолчанию UI привязан к loopback со случайным
 портом; `up.sh` выводит фактический адрес. На сервере с указанными override:
 `http://192.168.55.3:8092/admin/import` и `http://192.168.55.3:8092/docs`.
-Запуск сохраняет volumes/пароли/категории, делает backup перед миграцией 0003,
+Запуск сохраняет volumes, пароли и категории, делает backup перед миграциями 0003 и 0004,
 проверяет project RabbitMQ user/vhost, миграции, индекс и HTTP readiness.
 Shared сервисы не перезапускаются; PostgreSQL и Qdrant не публикуются наружу.
 Каталоги автоматически не загружаются.
+
+Рабочие страницы доступны по `/admin/import`, `/admin/review`,
+`/admin/categories` и `/admin/history`. Нагрузочный прогон на 25 000
+синтетических строк запускается командой `bash scripts/test.sh --catalog-load`.
 
 На Windows для локального MOCK (Docker Desktop и Git Bash, секрет PostgreSQL
 в собственном `.env`; отдельные VLM/embedding/RabbitMQ не нужны):

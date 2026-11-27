@@ -2,6 +2,9 @@
 """Отдельный настоящий AMQP smoke; inference этого транспортного теста явно MOCK."""
 
 import json
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -22,14 +25,21 @@ def test_shared_amqp_worker_claim_recovery(db_engine, snapshot, tmp_path, monkey
     baseline = Settings()
     if not baseline.live_smoke_enabled or baseline.job_transport != "rabbitmq":
         pytest.skip("Отдельный AMQP LIVE smoke требует project test credentials и Rabbit transport")
-    assert baseline.rabbitmq_user.startswith("product_search_engine_stage02_")
-    assert baseline.rabbitmq_vhost.startswith("product-search-engine-stage02-")
+    smoke_queue = baseline.rabbitmq_queue.startswith("product-search-engine.stage04.smoke.")
+    if smoke_queue:
+        assert baseline.rabbitmq_user == "product_search_engine_app"
+        assert baseline.rabbitmq_vhost == "product-search-engine"
+        assert UUID(baseline.rabbitmq_queue.rsplit(".", 1)[-1])
+    else:
+        assert baseline.rabbitmq_user.startswith("product_search_engine_stage02_")
+        assert baseline.rabbitmq_vhost.startswith("product-search-engine-stage02-")
     importer(db_engine).execute(snapshot, apply=True)
     settings = Settings(
         inference_mode="mock",
         job_transport="rabbitmq",
         upload_dir=tmp_path / "uploads",
         qdrant_collection_alias="product_taxonomy_categories_amqp_" + uuid4().hex,
+        worker_lease_seconds=60,
     )
     service = build_catalog(settings, db_engine)
     monkeypatch.setattr("app.workers.catalog.build_catalog", lambda value: service)
@@ -38,17 +48,44 @@ def test_shared_amqp_worker_claim_recovery(db_engine, snapshot, tmp_path, monkey
         path = input_file(tmp_path, [{"name": "Кабель тестовый", "price": "12.50"}])
         first = service.upload([(path.name, path)])["job"]["id"]
         service.start(first, "amqp-first")
-        result = run(settings, once=True)
+        started, release = threading.Event(), threading.Event()
+        original_process = service._process
+
+        def delayed_process(identifier):
+            """Держит реальный worker дольше heartbeat транспорта и его SQL lease."""
+            if identifier == first:
+                started.set()
+                assert release.wait(85)
+            original_process(identifier)
+
+        monkeypatch.setattr(service, "_process", delayed_process)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(run, settings, once=True)
+            try:
+                assert started.wait(15)
+                hold_start = time.monotonic()
+                service.queue.publish(first)
+                while time.monotonic() - hold_start < 62:
+                    time.sleep(1)
+                long_job_seconds = time.monotonic() - hold_start
+                assert service.store.recover(settings.worker_lease_seconds) == 0
+                assert service.job(first)["status"] == "running"
+                assert service.store.claim_job(first) is None
+            finally:
+                release.set()
+            result = future.result(timeout=20)
         assert result["mode"] == "mock"
         assert service.job(first)["processed_count"] == 1
-        duplicate = service.queue.receive()
-        assert duplicate is not None
-        connection, (channel, tag), identifier = duplicate
-        try:
-            assert identifier == first and service.store.claim_job(identifier) is None
-            channel.basic_ack(tag)
-        finally:
-            connection.close()
+        duplicate_total = 0
+        while duplicate := service.queue.receive():
+            connection, (channel, tag), identifier = duplicate
+            try:
+                assert identifier == first and service.store.claim_job(identifier) is None
+                channel.basic_ack(tag)
+                duplicate_total += 1
+            finally:
+                connection.close()
+        assert duplicate_total >= 1
         second = service.upload([(path.name, path)])["job"]["id"]
         service.start(second, "amqp-second")
         assert service.store.claim_job(second) == second
@@ -75,12 +112,19 @@ def test_shared_amqp_worker_claim_recovery(db_engine, snapshot, tmp_path, monkey
             "publisher_confirm": True,
             "duplicate_notification": "no_second_claim",
             "lease_recovery": "processed",
+            "long_job_seconds": round(long_job_seconds, 2),
             "report": report,
         }
         Path(".tmp/reports/amqp-live-smoke.json").write_text(
             json.dumps(artifact, ensure_ascii=False, indent=2), encoding="utf-8"
         )
     finally:
+        if smoke_queue:
+            connection = service.queue.connect()
+            try:
+                connection.channel().queue_delete(settings.rabbitmq_queue)
+            finally:
+                connection.close()
         state = service.index.status()
         if state.get("collection_name"):
             service.index.request(

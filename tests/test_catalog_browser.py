@@ -46,6 +46,108 @@ def browser_workspace(catalog):
         thread.join(timeout=10)
 
 
+def test_public_catalog_filters_pagination_and_price_card(browser_workspace, tmp_path):
+    """На обычном HTTP показывает ветки, фильтры и карточку с исходной ценой."""
+    service, address = browser_workspace
+    parent = service.create_category({"name": "Стенд", "reason": "Тест"}, "test", "catalog-root")
+    child = service.create_category(
+        {"name": "Кабельная продукция", "parent_id": parent["id"], "reason": "Тест"},
+        "test",
+        "catalog-leaf",
+    )
+    job = run_import(
+        service,
+        input_file(
+            tmp_path,
+            [
+                {
+                    "name": "Кабель стендовый",
+                    "mpn": "PSE-0401",
+                    "manufacturer": "Пробный завод",
+                    "seller": "Пробный магазин",
+                    "price": "49.50",
+                    "currency": "RUB",
+                    "price_date": "2024-11-15",
+                    "product_url": "https://example.org/catalog-example",
+                },
+            ],
+        ),
+    )
+    item = service.report(job)["items"][0]
+    service.decide(
+        item["id"],
+        {"category_id": child["id"], "expected_version": item["processing_version"]},
+        "test",
+        "catalog-assignment",
+    )
+    with service.store.transaction() as unit:
+        for n in range(26):
+            unit.add("products", canonical_name=f"Изделие без категории {n:02d}")
+        unit.update(
+            "products",
+            item["product_id"],
+            attributes={
+                "understanding": {
+                    "attributes": [{"name": "Сечение", "value": "2,5", "unit": "мм²"}]
+                }
+            },
+        )
+    errors = []
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(
+            args=[
+                "--no-sandbox",
+                "--host-resolver-rules=MAP pse.test 127.0.0.1",
+                "--no-proxy-server",
+            ]
+        )
+        page = browser.new_page(viewport={"width": 1500, "height": 960})
+        page.on("pageerror", lambda error: errors.append(str(error)))
+        base = address.replace("127.0.0.1", "pse.test")
+        page.goto(base + "/")
+        assert not page.evaluate("isSecureContext")
+        expect(page.locator("#catalog-total")).to_have_text("Товаров: 27")
+        page.locator("#catalog-next").click()
+        expect(page.locator("#catalog-page")).to_have_text("2 / 2")
+        expect(page.locator("#catalog-products tr")).to_have_count(2)
+        page.get_by_role("button", name="Подкатегории: Стенд").click()
+        page.get_by_role("button", name="Кабельная продукция 1").click()
+        expect(page.locator("#catalog-total")).to_have_text("Товаров: 1")
+        page.get_by_role("button", name="Кабель стендовый").click()
+        expect(page.locator("#catalog-card-title")).to_have_text("Кабель стендовый")
+        expect(page.locator("#catalog-identity")).to_contain_text("Пробный завод")
+        expect(page.locator("#catalog-features")).to_contain_text("Сечение")
+        expect(page.locator("#catalog-links a").first).to_have_attribute(
+            "href", "https://example.org/catalog-example"
+        )
+        expect(page.locator("#catalog-offers")).to_contain_text("Пробный магазин")
+        expect(page.locator("#catalog-offers")).to_contain_text("2024-11-15")
+        expect(page.locator("#catalog-offers")).to_contain_text("49,5 RUB")
+        expect(page.locator("#catalog-card")).to_contain_text("Актуальная цена неизвестна")
+        Path(".tmp/browser/catalog").mkdir(parents=True, exist_ok=True)
+        page.screenshot(path=".tmp/browser/catalog/card.png", full_page=True)
+        page.locator("#catalog-close").click()
+        page.locator("#catalog-uncategorized").click()
+        expect(page.locator("#catalog-total")).to_have_text("Товаров: 26")
+        page.locator("#catalog-sort").select_option("name_desc")
+        expect(page.locator("#catalog-products tr").first).to_contain_text("25")
+        page.locator("#catalog-all").click()
+        page.get_by_label("Производитель").select_option(label="Пробный завод")
+        expect(page.locator("#catalog-total")).to_have_text("Товаров: 1")
+        page.get_by_label("Поиск", exact=True).fill("pse0401")
+        page.get_by_role("button", name="Найти").click()
+        expect(page.locator("#catalog-products")).to_contain_text("PSE-0401")
+        page.get_by_label("Поиск", exact=True).fill("нет-и-не-было")
+        page.get_by_role("button", name="Найти").click()
+        expect(page.locator("#catalog-empty")).to_be_visible()
+        page.set_viewport_size({"width": 360, "height": 800})
+        assert page.evaluate("document.documentElement.scrollWidth === innerWidth")
+        page.get_by_role("link", name="История").click()
+        expect(page.locator("#history-view")).to_be_visible()
+        assert not errors
+        browser.close()
+
+
 def test_review_remaining_and_archive_over_http(browser_workspace, tmp_path, monkeypatch):
     """Оператор утверждает вариант, повторяет остаток и подтверждает удаление с историей."""
     service, address = browser_workspace

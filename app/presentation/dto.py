@@ -1,7 +1,8 @@
 # app/presentation/dto.py
 """Публичные response DTO Swagger для прогресса, позиций, preview и SQL-дерева."""
 
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
 from typing import Literal
 from uuid import UUID
 
@@ -125,5 +126,111 @@ class TreeNodeView(BaseModel):
     path_names: list[str]
     aliases: list[str] = Field(default_factory=list)
     product_count: int
+    subtree_product_count: int
     depth: int
     ancestors_active: bool
+
+
+class ProductView(BaseModel):
+    """Поля строки каталога из Product и его справочников."""
+
+    id: UUID
+    canonical_name: str
+    category_id: UUID | None
+    category_name: str | None
+    manufacturer_id: UUID | None
+    manufacturer_name: str | None
+    manufacturer_status: str | None
+    brand_id: UUID | None
+    brand_name: str | None
+    brand_status: str | None
+    mpn: str | None
+    normalized_mpn: str | None
+    model: str | None
+    product_type: str | None
+    unit_code: str | None
+    status: str
+    attributes: dict
+    created_at: datetime
+    updated_at: datetime
+
+
+class ProductsPage(BaseModel):
+    """Результат поиска и стабильной SQL-пагинации."""
+
+    items: list[ProductView]
+    total: int
+    offset: int
+    limit: int
+
+
+class ProductFeature(BaseModel):
+    """Характеристика изделия, сохранённая при понимании номенклатуры."""
+
+    name: str
+    value: str
+    unit: str | None = None
+
+
+class SourceLink(BaseModel):
+    """Исходная ссылка, сохранённая при импорте."""
+
+    url: str
+    source_name: str
+
+
+class ProductDetailView(ProductView):
+    """Карточка с путём категории, характеристиками и исходными ссылками."""
+
+    category_path: list[str]
+    features: list[ProductFeature]
+    source_links: list[SourceLink]
+
+
+class ManufacturerView(BaseModel):
+    """Отображаемое имя производителя и статус его сведений."""
+
+    id: UUID
+    name: str
+    status: str
+
+
+class PriceObservationView(BaseModel):
+    """Историческое наблюдение, его исходные поля и сведения о верификации."""
+
+    id: UUID
+    raw_price: str | None
+    amount: Decimal | None
+    currency: str | None
+    sale_unit: str | None
+    source_reported_date: date | None
+    observed_at: datetime
+    quality_status: str
+    valid_from: datetime | None
+    valid_to: datetime | None
+    verified_amount: Decimal | None
+    verified_currency: str | None
+    verified_unit: str | None
+
+
+class OfferView(BaseModel):
+    """Сведения о продавце и источнике с ограниченной историей цен."""
+
+    id: UUID
+    seller_name: str | None
+    source_name: str
+    origin_url: str | None
+    sale_unit: str | None
+    pack_quantity: Decimal | None
+    price_history: list[PriceObservationView]
+    history_total: int
+
+
+class OffersPage(BaseModel):
+    """Сохранённые предложения и история наблюдений по одному товару."""
+
+    items: list[OfferView]
+    total: int
+    offset: int
+    limit: int
+    price_policy: Literal["historical"] = "historical"

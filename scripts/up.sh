@@ -27,8 +27,8 @@ fi
 "${dc[@]}" build app
 "${dc[@]}" up -d --wait --wait-timeout 120 postgres qdrant
 revision="$("${dc[@]}" exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "SELECT version_num FROM alembic_version"' 2>/dev/null || true)"
-if [[ "$revision" == '0002_partial_import' ]]; then
-    backup=".tmp/backups/pre-stage02-$(date -u +%Y%m%dT%H%M%SZ).dump"
+if [[ "$revision" == '0002_partial_import' || "$revision" == '0003_catalog_pipeline' ]]; then
+    backup=".tmp/backups/pre-${revision}-$(date -u +%Y%m%dT%H%M%SZ).dump"
     "${dc[@]}" exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' > "$backup"
     test -s "$backup"
     printf 'Backup собственной БД: %s\n' "$backup"
@@ -70,8 +70,21 @@ fi
 "${dc[@]}" run --rm -T --no-deps app infrastructure-check
 "${dc[@]}" up -d worker api
 "${dc[@]}" up -d --wait --wait-timeout 900 worker api
-"${dc[@]}" exec -T api /app/.tmp/venv/bin/python -c 'import httpx,os; p=os.getenv("API_PORT","8000"); r=httpx.get("http://127.0.0.1:"+p+"/health/ready"); r.raise_for_status(); print(r.json()); r=httpx.get("http://127.0.0.1:"+p+"/admin/import"); r.raise_for_status(); assert "upload-form" in r.text; print("UI: HTTP 200")'
+"${dc[@]}" exec -T api /app/.tmp/venv/bin/python -c '
+import os
+import httpx
+
+base = "http://127.0.0.1:" + os.getenv("API_PORT", "8000")
+ready = httpx.get(base + "/health/ready")
+ready.raise_for_status()
+print(ready.json())
+for path, marker in (("/", "catalog-search"), ("/admin/import", "upload-form")):
+    response = httpx.get(base + path)
+    response.raise_for_status()
+    assert marker in response.text
+    print("UI", path, response.status_code)
+'
 "${dc[@]}" ps
-printf 'UI /admin/import и Swagger /docs по опубликованному адресу: '
+printf 'Каталог /, импорт /admin/import и Swagger /docs по опубликованному адресу: '
 container_port="$("${dc[@]}" exec -T api /app/.tmp/venv/bin/python -c 'from app.settings import Settings; print(Settings().api_port)')"
 "${dc[@]}" port api "$container_port"
